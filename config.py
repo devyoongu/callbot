@@ -12,11 +12,12 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 load_dotenv(SCRIPT_DIR / ".env")
 
 # ── SIP 등록 ──────────────────────────────────────────────────────────
-SIP_SERVER   = os.getenv("SIP_SERVER", "172.31.79.202")
-SIP_PORT     = int(os.getenv("SIP_PORT", "5060"))
-SIP_USERNAME = os.getenv("SIP_USERNAME", "2001")
-SIP_PASSWORD = os.getenv("SIP_PASSWORD", "secret2001")
-_LOCAL_IP    = os.getenv("LOCAL_IP", "")
+SIP_SERVER      = os.getenv("SIP_SERVER", "172.31.79.202")
+SIP_PORT        = int(os.getenv("SIP_PORT", "5060"))
+SIP_LOCAL_PORT  = int(os.getenv("SIP_LOCAL_PORT", "5060"))
+SIP_USERNAME    = os.getenv("SIP_USERNAME", "2001")
+SIP_PASSWORD    = os.getenv("SIP_PASSWORD", "secret2001")
+_LOCAL_IP       = os.getenv("LOCAL_IP", "")
 
 # ── Google Cloud ───────────────────────────────────────────────────────
 GCP_PROJECT_ID   = os.getenv("GCP_PROJECT_ID", "gen-lang-client-0665942228")
@@ -49,9 +50,21 @@ def athena_configured() -> bool:
 
 
 def get_local_ip() -> str:
-    """로컬 네트워크 IP 반환. LOCAL_IP 환경변수가 설정되면 그 값 사용."""
+    """로컬 네트워크 IP 반환. LOCAL_IP 환경변수가 설정되면 그 값 사용.
+
+    SIP 서버 방향으로 실제 사용되는 인터페이스 IP를 감지합니다.
+    VPN 등 복수 네트워크 인터페이스 환경에서 정확한 IP를 반환합니다.
+    """
     if _LOCAL_IP:
         return _LOCAL_IP
+    # SIP 서버 방향으로 나가는 인터페이스 IP 감지 (소켓은 실제 연결하지 않음)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((SIP_SERVER, SIP_PORT))
+            return s.getsockname()[0]
+    except Exception:
+        pass
+    # fallback: 인터넷 연결 기반 감지
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))

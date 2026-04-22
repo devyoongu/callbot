@@ -40,6 +40,7 @@ def main():
     logger.info("=" * 60)
     logger.info("AI Callbot Starting")
     logger.info(f"  SIP Server : {cfg.SIP_SERVER}:{cfg.SIP_PORT}")
+    logger.info(f"  Local Port : {cfg.SIP_LOCAL_PORT}")
     logger.info(f"  Extension  : {cfg.SIP_USERNAME}")
     logger.info(f"  Local IP   : {local_ip}")
     logger.info(f"  STT Model  : {cfg.GCP_STT_MODEL}")
@@ -59,6 +60,7 @@ def main():
         username=cfg.SIP_USERNAME,
         password=cfg.SIP_PASSWORD,
         myIP=local_ip,
+        sipPort=cfg.SIP_LOCAL_PORT,
         callCallback=handle_call,
     )
 
