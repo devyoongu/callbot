@@ -1,0 +1,9 @@
+pyVoIP==1.6.4
+google-cloud-speech==2.27.0
+google-cloud-texttospeech==2.16.3
+google-auth==2.29.0
+aiohttp==3.9.5
+requests==2.32.3
+numpy==1.26.4
+scipy==1.13.0
+python-dotenv==1.0.1
