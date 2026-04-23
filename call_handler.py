@@ -8,10 +8,11 @@ import audioop
 import time
 import uuid
 import logging
+from typing import Tuple
 
 import config as cfg
 from audio_source import CallAudioSource
-from stt import create_stt
+from stt import GoogleSTTV2, create_stt
 from tts import synthesize_pcm_8k
 from athena import AthenaClient
 
@@ -86,9 +87,8 @@ def handle_call(call):
         while call.state == CallState.ANSWERED:
             logger.info(f"[{call_id[:8]}] Turn {dialog_count}: Listening...")
 
-            # TTS 에코 소거: 직전 TTS 재생 후 RTP 버퍼에 남은 에코를 버린다.
-            # 0.5초간 오디오를 읽되 STT에 전달하지 않음.
-            _drain_audio(call, seconds=0.5)
+            # TTS 에코 소거: pyVoIP 수신 버퍼가 빌 때까지 빠르게 드레인
+            _drain_rtp_buffer(call)
 
             # 3a. STT 스트리밍 청취
             audio_src = CallAudioSource(call, timeout_sec=cfg.LISTEN_TIMEOUT_SEC)
@@ -97,8 +97,10 @@ def handle_call(call):
             try:
                 stt.initialize()
                 stt.start_streaming(audio_src)
-                success, transcript = stt.wait_for_result(
-                    timeout=cfg.LISTEN_TIMEOUT_SEC + 5
+                # 블로킹 wait_for_result() 대신 능동 폴링 루프 사용
+                # (robi-t-callbot ai_handler.detect_voice() 폴링 패턴 적용)
+                success, transcript = _poll_stt_result(
+                    stt, audio_src, call, call_id, dialog_count
                 )
             except Exception as e:
                 logger.error(f"[{call_id[:8]}] STT error: {e}")
@@ -189,23 +191,148 @@ def handle_call(call):
         logger.info(f"[{call_id[:8]}] Call ended (turns={dialog_count})")
 
 
-def _drain_audio(call, seconds: float = 0.5):
+def _poll_stt_result(
+    stt: GoogleSTTV2,
+    audio_src: CallAudioSource,
+    call,
+    call_id: str,
+    dialog_count: int,
+) -> Tuple[bool, str]:
     """
-    TTS 재생 직후 RTP 에코 소거용 오디오 버퍼 드레인
+    robi-t-callbot ai_handler.detect_voice() 의 폴링 루프 패턴을 callbot에 적용.
 
-    pyVoIP의 RTP 수신 버퍼를 비워 이전 TTS 에코가 STT에 유입되지 않도록 합니다.
-    read_audio()로 실제 읽되 데이터는 버립니다.
+    블로킹 wait_for_result() 대신 50ms 주기 폴링으로 STT 상태를 모니터링.
+
+    흐름:
+      ① speech_started 감지 → no-speech 타임아웃 카운터 리셋
+      ② EOS 감지 → audio_src.stop() (generator는 이미 break 완료)
+      ③ final transcript 감지 → 반환
+      ④ no-speech 타임아웃: LISTEN_TIMEOUT_SEC 동안 발화 없으면 "non_voice"
+      ⑤ post-EOS 타임아웃: EOS 후 8s 내 final result 없으면 "timeout"
     """
     from pyVoIP.VoIP import CallState
-    deadline = time.time() + seconds
+
+    POLL_INTERVAL       = 0.05                                      # 50ms (robi-t-callbot 동일)
+    MAX_NO_SPEECH_TICKS = int(cfg.LISTEN_TIMEOUT_SEC / POLL_INTERVAL)
+    MAX_POST_EOS_TICKS  = int(8.0 / POLL_INTERVAL)                  # EOS 후 최대 8s 대기
+    # EOS flush: 16 chunks × 125ms = 2s + Google 처리 대기 = 8s 여유 필요
+
+    speech_started  = False
+    eos_detected    = False
+    no_speech_ticks = 0
+    post_eos_ticks  = 0
+    prev_transcript = ""
+
+    while True:
+        # 통화 종료 체크
+        try:
+            if call.state != CallState.ANSWERED:
+                break
+        except Exception:
+            break
+
+        # STT 내부 오류 즉시 반환
+        if stt._stt_error:
+            return False, "error"
+
+        # ① speech_started 폴링
+        started, _ = stt.get_speech_started()
+        if started and not speech_started:
+            speech_started  = True
+            no_speech_ticks = 0
+            logger.debug(f"[{call_id[:8]}] Turn {dialog_count}: Speech started")
+
+        # ② EOS 폴링 — robi-t-callbot handle_eos_detected() 패턴
+        # generator는 이미 break되어 있거나 break 직전이므로
+        # audio_src.stop()은 안전망 역할 (flush 없이 즉시 종료)
+        eos, eos_t = stt.get_and_consume_eos()
+        if eos and not eos_detected:
+            eos_detected   = True
+            post_eos_ticks = 0
+            audio_src.stop()
+            logger.info(
+                f"[{call_id[:8]}] Turn {dialog_count}: EOS detected"
+                + (f" at {eos_t:.3f}" if eos_t else "")
+                + ", audio stopped"
+            )
+
+        # ③ final transcript 폴링
+        transcript = stt.get_final_transcript()
+        if transcript and transcript != prev_transcript:
+            prev_transcript = transcript
+            return True, transcript
+
+        # result_event 최종 확인 (스트림 종료 fallback)
+        if stt._result_event.is_set():
+            if stt._stt_error:
+                return False, stt._stt_error
+            return True, stt._final_transcript
+
+        # ④ no-speech 타임아웃
+        if not speech_started and not eos_detected:
+            no_speech_ticks += 1
+            if no_speech_ticks > MAX_NO_SPEECH_TICKS:
+                logger.info(
+                    f"[{call_id[:8]}] Turn {dialog_count}: "
+                    f"No speech timeout ({cfg.LISTEN_TIMEOUT_SEC}s)"
+                )
+                return False, "non_voice"
+
+        # ⑤ post-EOS 타임아웃
+        if eos_detected:
+            post_eos_ticks += 1
+            if post_eos_ticks > MAX_POST_EOS_TICKS:
+                logger.warning(
+                    f"[{call_id[:8]}] Turn {dialog_count}: "
+                    f"Post-EOS final result timeout after {post_eos_ticks * POLL_INTERVAL:.1f}s"
+                )
+                return False, "timeout"
+
+        # 이벤트 기반 대기 — busy-wait 없이 최대 POLL_INTERVAL 대기
+        stt._transcript_ready.wait(timeout=POLL_INTERVAL)
+        if stt._transcript_ready.is_set():
+            stt._transcript_ready.clear()
+
+    return False, "non_voice"
+
+
+def _drain_rtp_buffer(call, max_sec: float = 8.0, min_sec: float = 0.15):
+    """
+    TTS 재생 후 에코 소거: pyVoIP 수신 버퍼가 빌 때까지 드레인
+
+    robi-t-callbot prepare_for_recording() 패턴 적용:
+      - min_sec 동안 무조건 드레인 (TTS 잔여 에코 완전 소거)
+      - 연속 16회 무음(≈320ms) 감지 후 min_sec 경과 시 종료
+      - 드레인 완료 후 0.2s 안정화 대기 → STT 시작
+
+    max_sec=8.0: 긴 TTS(10-12초) 재생 후 에코가 3-5초 이상 지속될 수 있음.
+    silence 감지 시 조기 종료되므로 짧은 TTS 이후에는 빠르게 빠져나옴.
+    """
+    from pyVoIP.VoIP import CallState
+    _SILENCE = b"\x80" * 160
+    deadline     = time.time() + max_sec
+    min_deadline = time.time() + min_sec
+    silence_run  = 0
+    drained      = 0
     while time.time() < deadline:
         if call.state != CallState.ANSWERED:
             break
         try:
-            call.read_audio(160, False)
+            raw = call.read_audio(160, False)
         except Exception:
             break
-        time.sleep(0.01)
+        if raw == _SILENCE:
+            silence_run += 1
+            # 최소 드레인 시간 경과 후 연속 16회 무음(≈320ms) = 버퍼 클리어
+            if silence_run >= 16 and time.time() >= min_deadline:
+                break
+        else:
+            silence_run = 0
+            drained += 1
+        time.sleep(0.005)   # 5ms — 1ms보다 CPU 친화적
+    logger.info(f"[Drain] {drained} echo chunks cleared, silence_run={silence_run}")
+    # 버퍼 클리어 후 스트림 안정화 대기 (robi-t-callbot prepare_for_recording 0.2s 패턴)
+    time.sleep(0.2)
 
 
 def _play_tts(call, text: str):
@@ -228,13 +355,11 @@ def _play_tts(call, text: str):
     silence    = b"\x80" * CHUNK_SIZE
 
     # RTP 스트림 프라이밍: 무음 0.5초 전송으로 RTP 경로 개통
-    # 프라이밍 중에도 수신 버퍼 드레인 (에코 누적 방지)
     for _ in range(25):
         if call.state != CallState.ANSWERED:
             return
         try:
             call.writeAudio(silence)
-            call.read_audio(160, False)  # 수신 버퍼 실시간 소거
         except Exception:
             return
         time.sleep(SLEEP_SEC)
@@ -262,7 +387,6 @@ def _play_tts(call, text: str):
 
         try:
             call.writeAudio(chunk)
-            call.read_audio(160, False)  # TTS 재생 중 에코 실시간 소거
             sent += 1
         except Exception as e:
             logger.warning(f"[TTS] writeAudio error: {e}")
