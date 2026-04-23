@@ -31,7 +31,7 @@ def handle_call(call):
 
     try:
         call.answer()
-        time.sleep(0.5)  # SIP/RTP 미디어 스트림 안정화 대기
+        time.sleep(1.5)  # SIP/RTP 미디어 스트림 안정화 대기 (VPN 환경 고려)
 
         # ── 1. Athena 세션 시작 ──────────────────────────────────────
         athena  = None
@@ -44,7 +44,7 @@ def handle_call(call):
                     auth_token=cfg.ATHENA_AUTH,
                     users_id=int(cfg.ATHENA_USER_ID),
                     chat_rooms_id=int(cfg.ATHENA_CHAT_ROOMS_ID),
-                    scenarios_id=int(cfg.ATHENA_SCENARIOS_ID),
+                    scenarios_id=cfg.ATHENA_SCENARIOS_ID,
                 )
                 thread_id = athena.start(uui=call_id, voc_types=["inquiry"])
                 if thread_id:
@@ -178,18 +178,32 @@ def _play_tts(call, text: str):
     if not text or not text.strip():
         return
 
+    from pyVoIP.VoIP import CallState
+
+    # 320 bytes = 160 samples × 2 bytes = 20ms at 8kHz
+    CHUNK_SIZE = 320
+    SLEEP_SEC  = 0.018  # 20ms보다 약간 짧게 → 버퍼 유지
+    silence    = b"\x00" * CHUNK_SIZE
+
+    # RTP 스트림 프라이밍: 무음 0.5초 전송으로 RTP 경로 개통
+    for _ in range(25):
+        if call.state != CallState.ANSWERED:
+            return
+        try:
+            call.writeAudio(silence)
+        except Exception:
+            return
+        time.sleep(SLEEP_SEC)
+
     try:
         pcm_8k = synthesize_pcm_8k(text)
     except Exception as e:
         logger.error(f"[TTS] Synthesis failed: {e}")
         return
 
-    # 320 bytes = 160 samples × 2 bytes = 20ms at 8kHz
-    CHUNK_SIZE = 320
-    SLEEP_SEC  = 0.018  # 20ms보다 약간 짧게 → 버퍼 유지
-
+    logger.info(f"[TTS] Playing {len(pcm_8k)} bytes ({len(pcm_8k)//320} chunks): {text[:40]!r}")
+    sent = 0
     for i in range(0, len(pcm_8k), CHUNK_SIZE):
-        from pyVoIP.VoIP import CallState
         if call.state != CallState.ANSWERED:
             break
 
@@ -200,8 +214,11 @@ def _play_tts(call, text: str):
 
         try:
             call.writeAudio(chunk)
+            sent += 1
         except Exception as e:
             logger.warning(f"[TTS] writeAudio error: {e}")
             break
 
         time.sleep(SLEEP_SEC)
+
+    logger.info(f"[TTS] Done ({sent} chunks sent)")

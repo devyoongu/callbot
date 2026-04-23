@@ -36,7 +36,7 @@ class AthenaClient:
         auth_token: str,
         users_id: int,
         chat_rooms_id: int,
-        scenarios_id: int,
+        scenarios_id,  # int 또는 str (e.g. "robi-gpt-dev:workflow_xxx")
     ):
         self.api_url       = api_url.rstrip("/")
         self.auth_token    = auth_token

@@ -20,6 +20,7 @@ from pathlib import Path
 # callbot/ 디렉터리를 Python 경로에 추가
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
 
+import os
 import config as cfg
 from call_handler import handle_call
 
@@ -54,6 +55,11 @@ def main():
         logger.error("pyVoIP not installed. Run: pip install pyVoIP==1.6.4")
         sys.exit(1)
 
+    # RTP 포트 범위를 좁혀서 방화벽 관리 및 디버깅 용이하게 설정
+    RTP_PORT_LOW  = int(os.environ.get("RTP_PORT_LOW",  "16000"))
+    RTP_PORT_HIGH = int(os.environ.get("RTP_PORT_HIGH", "16100"))
+    logger.info(f"  RTP Range  : {RTP_PORT_LOW}-{RTP_PORT_HIGH}")
+
     phone = VoIPPhone(
         server=cfg.SIP_SERVER,
         port=cfg.SIP_PORT,
@@ -62,6 +68,8 @@ def main():
         myIP=local_ip,
         sipPort=cfg.SIP_LOCAL_PORT,
         callCallback=handle_call,
+        rtpPortLow=RTP_PORT_LOW,
+        rtpPortHigh=RTP_PORT_HIGH,
     )
 
     phone.start()

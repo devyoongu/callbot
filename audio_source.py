@@ -54,6 +54,10 @@ class CallAudioSource:
         deadline = time.time() + self._timeout_sec
         self._buffer = b""
 
+        total_reads      = 0
+        non_empty_reads  = 0
+        first_audio_logged = False
+
         while not self._stop_event.is_set() and time.time() < deadline:
             # 통화가 끊어지면 종료
             try:
@@ -70,8 +74,19 @@ class CallAudioSource:
                 print(f"[AudioSource] readAudio error: {e}")
                 break
 
+            total_reads += 1
+
             if raw:
+                non_empty_reads += 1
                 self._buffer += raw
+                if not first_audio_logged:
+                    print(f"[AudioSource] First audio received ({len(raw)} bytes) after {total_reads} reads")
+                    first_audio_logged = True
+
+            # 2초 후에도 오디오가 전혀 없으면 경고 (RTP 미수신 진단)
+            elif total_reads == 100 and non_empty_reads == 0:
+                print(f"[AudioSource] WARNING: No RTP audio received after {total_reads} reads — "
+                      f"check Asterisk pjsip.conf direct_media setting")
 
             # 2000 bytes (125ms at 8kHz) 누적 시 업샘플 후 yield
             while len(self._buffer) >= _TARGET_8K_BYTES:
@@ -83,3 +98,5 @@ class CallAudioSource:
             # 오디오가 없는 경우 짧은 대기 (busy-loop 방지)
             if not raw:
                 time.sleep(0.01)
+
+        print(f"[AudioSource] Done: {non_empty_reads}/{total_reads} reads had audio")
