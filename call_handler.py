@@ -4,6 +4,7 @@ callbot/call_handler.py — 통화 상태 머신
 pyVoIP callCallback에서 호출됩니다 (별도 스레드).
 Athena 세션 관리, STT/TTS 루프, 통화 종료 처리를 담당합니다.
 """
+import audioop
 import time
 import uuid
 import logging
@@ -31,6 +32,21 @@ def handle_call(call):
 
     try:
         call.answer()
+
+        # ── RTP 수신 소켓 NAT 핀홀 개통 ──────────────────────────────
+        # pyVoIP는 sin(수신)과 sout(송신) 소켓을 분리합니다.
+        # TTS 프라이밍은 sout→Asterisk 경로만 열어주므로,
+        # sin←Asterisk 방향은 sin이 먼저 더미 패킷을 보내야 핀홀이 열립니다.
+        for rtp_client in call.RTPClients:
+            try:
+                rtp_client.sin.sendto(b'\x00', (rtp_client.outIP, rtp_client.outPort))
+                logger.info(
+                    f"[RTP] Hole punch: sin(:{rtp_client.inPort}) → "
+                    f"{rtp_client.outIP}:{rtp_client.outPort}"
+                )
+            except Exception as e:
+                logger.warning(f"[RTP] Hole punch failed: {e}")
+
         time.sleep(1.5)  # SIP/RTP 미디어 스트림 안정화 대기 (VPN 환경 고려)
 
         # ── 1. Athena 세션 시작 ──────────────────────────────────────
@@ -173,17 +189,20 @@ def _play_tts(call, text: str):
     """
     TTS 합성 후 pyVoIP writeAudio()로 재생
 
-    320 bytes (20ms, 8kHz 16-bit) 단위로 전송합니다.
+    pyVoIP encode_pcmu()는 8-bit unsigned PCM (width=1)을 기대합니다.
+    160 bytes (20ms, 8kHz 8-bit) 단위로 전송합니다.
     """
     if not text or not text.strip():
         return
 
     from pyVoIP.VoIP import CallState
 
-    # 320 bytes = 160 samples × 2 bytes = 20ms at 8kHz
-    CHUNK_SIZE = 320
+    # pyVoIP 내부 encode_pcmu는 width=1 (8-bit) 입력을 기대함
+    # 160 samples × 1 byte = 20ms at 8kHz
+    CHUNK_SIZE = 160
     SLEEP_SEC  = 0.018  # 20ms보다 약간 짧게 → 버퍼 유지
-    silence    = b"\x00" * CHUNK_SIZE
+    # pyVoIP 무음: 0x80 = 128 (8-bit unsigned에서 0 중심값)
+    silence    = b"\x80" * CHUNK_SIZE
 
     # RTP 스트림 프라이밍: 무음 0.5초 전송으로 RTP 경로 개통
     for _ in range(25):
@@ -196,21 +215,25 @@ def _play_tts(call, text: str):
         time.sleep(SLEEP_SEC)
 
     try:
-        pcm_8k = synthesize_pcm_8k(text)
+        pcm_16k = synthesize_pcm_8k(text)  # 16-bit signed PCM at 8kHz
     except Exception as e:
         logger.error(f"[TTS] Synthesis failed: {e}")
         return
 
-    logger.info(f"[TTS] Playing {len(pcm_8k)} bytes ({len(pcm_8k)//320} chunks): {text[:40]!r}")
+    # 16-bit signed → 8-bit signed → 8-bit unsigned (pyVoIP가 기대하는 포맷)
+    pcm_8bit = audioop.lin2lin(pcm_16k, 2, 1)    # 16-bit → 8-bit signed
+    pcm_8bit = audioop.bias(pcm_8bit, 1, 128)     # signed → unsigned (0~255)
+
+    logger.info(f"[TTS] Playing {len(pcm_8bit)} bytes ({len(pcm_8bit)//160} chunks): {text[:40]!r}")
     sent = 0
-    for i in range(0, len(pcm_8k), CHUNK_SIZE):
+    for i in range(0, len(pcm_8bit), CHUNK_SIZE):
         if call.state != CallState.ANSWERED:
             break
 
-        chunk = pcm_8k[i:i + CHUNK_SIZE]
-        # 마지막 청크가 짧으면 무음으로 패딩
+        chunk = pcm_8bit[i:i + CHUNK_SIZE]
+        # 마지막 청크가 짧으면 무음(0x80)으로 패딩
         if len(chunk) < CHUNK_SIZE:
-            chunk = chunk + b"\x00" * (CHUNK_SIZE - len(chunk))
+            chunk = chunk + b"\x80" * (CHUNK_SIZE - len(chunk))
 
         try:
             call.writeAudio(chunk)

@@ -1,21 +1,29 @@
 """
 callbot/audio_source.py — pyVoIP RTP 오디오 → GoogleSTTV2 스트리밍 입력 변환
 
-pyVoIP call.readAudio() 는 8kHz 16-bit PCM을 ~320 bytes 단위로 반환합니다.
+pyVoIP call.read_audio() 는 8kHz 8-bit unsigned PCM을 160 bytes 단위로 반환합니다.
+  - encode_pcmu/parse_pcmu 내부가 audioop width=1 (8-bit) 기준
+  - 반환값: 0~255 unsigned (무음=0x80)
+
 GoogleSTTV2는 16kHz PCM 4000 bytes 청크를 기대합니다.
 
 이 클래스가 수행하는 변환:
-  readAudio() (~320 bytes, 8kHz) 누적 →
-  2000 bytes (125ms, 8kHz) 묶음 →
+  read_audio() (160 bytes, 8kHz 8-bit unsigned, non-blocking) →
+  8-bit unsigned → 16-bit signed 변환 →
+  2000 bytes (125ms, 8kHz 16-bit) 묶음 →
   upsample_8k_to_16k() →
-  4000 bytes (125ms, 16kHz) 청크 yield
+  4000 bytes (125ms, 16kHz 16-bit) 청크 yield
 """
+import audioop
 import time
 import threading
 from audio_utils import upsample_8k_to_16k
 
-# 8kHz에서 125ms = 2000 bytes (1000 samples × 2 bytes)
+# 8kHz에서 125ms = 2000 bytes (1000 samples × 2 bytes, 16-bit 변환 후)
 _TARGET_8K_BYTES = 2000
+
+# pyVoIP 무음 sentinel (8-bit unsigned, 중심값=0x80)
+_SILENCE_160 = b"\x80" * 160
 
 
 class CallAudioSource:
@@ -67,36 +75,42 @@ class CallAudioSource:
             if state != CallState.ANSWERED:
                 break
 
-            # readAudio() — pyVoIP 내부에서 ~20ms 단위로 블로킹
+            # non-blocking read: 무음도 STT에 전달해 Google STT 스트림 유지
+            # (blocking=True이면 무음 구간에서 generator가 멈춰 409 타임아웃 발생)
             try:
-                raw = self._call.readAudio()
+                raw = self._call.read_audio(160, False)
             except Exception as e:
                 print(f"[AudioSource] readAudio error: {e}")
                 break
 
             total_reads += 1
+            is_silence = (raw == _SILENCE_160)
 
-            if raw:
+            if not is_silence:
                 non_empty_reads += 1
-                self._buffer += raw
                 if not first_audio_logged:
                     print(f"[AudioSource] First audio received ({len(raw)} bytes) after {total_reads} reads")
                     first_audio_logged = True
 
-            # 2초 후에도 오디오가 전혀 없으면 경고 (RTP 미수신 진단)
-            elif total_reads == 100 and non_empty_reads == 0:
+            # 2초 후에도 실제 오디오가 전혀 없으면 경고 (RTP 미수신 진단)
+            if total_reads == 100 and non_empty_reads == 0:
                 print(f"[AudioSource] WARNING: No RTP audio received after {total_reads} reads — "
                       f"check Asterisk pjsip.conf direct_media setting")
 
-            # 2000 bytes (125ms at 8kHz) 누적 시 업샘플 후 yield
+            # 8-bit unsigned → 16-bit signed 변환 (pyVoIP parse_pcmu width=1 역변환)
+            raw_signed = audioop.bias(raw, 1, -128)      # 0~255 → -128~127
+            raw_16bit  = audioop.lin2lin(raw_signed, 1, 2)  # 8-bit → 16-bit signed
+            self._buffer += raw_16bit
+
+            # 2000 bytes (125ms at 8kHz 16-bit) 누적 시 업샘플 후 yield
             while len(self._buffer) >= _TARGET_8K_BYTES:
                 chunk_8k = self._buffer[:_TARGET_8K_BYTES]
                 self._buffer = self._buffer[_TARGET_8K_BYTES:]
                 chunk_16k = upsample_8k_to_16k(chunk_8k)
                 yield chunk_16k
 
-            # 오디오가 없는 경우 짧은 대기 (busy-loop 방지)
-            if not raw:
+            # 무음(RTP 미도착)이면 짧은 대기 (busy-loop 방지)
+            if is_silence:
                 time.sleep(0.01)
 
         print(f"[AudioSource] Done: {non_empty_reads}/{total_reads} reads had audio")

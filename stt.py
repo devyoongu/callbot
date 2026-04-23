@@ -225,6 +225,10 @@ class GoogleSTTV2:
         for chunk in self._audio_source:
             if self._stop:
                 break
+            if not self._process_audio:
+                # VAD END 이후: 오디오 전송 중단 → request generator 종료
+                # Google STT 서버가 스트림 종료로 인식하고 final transcript 반환
+                break
             if not chunk:
                 continue
 
@@ -281,10 +285,11 @@ class GoogleSTTV2:
             SpeechEventType.SPEECH_ACTIVITY_END,
             SpeechEventType.END_OF_SINGLE_UTTERANCE,
         ):
-            print("[STT] VAD: Speech END / EOS")
+            print("[STT] VAD: Speech END / EOS — waiting for final transcript")
             self.eos_done       = True
             self._process_audio = False
-            self._stop          = True
+            # _stop은 설정하지 않음: 오디오 전송은 중단하되 response 루프는 계속 돌아야
+            # Google STT가 final transcript를 반환할 때까지 responses 이터레이터를 유지해야 함
 
 
 def create_stt(credentials_dir: str = None) -> GoogleSTTV2:
