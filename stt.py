@@ -199,8 +199,16 @@ class GoogleSTTV2:
                     if result.is_final:
                         self._final_transcript = transcript.strip() or "non_voice"
                         print(f"[STT] Final: '{self._final_transcript}'")
+                        self._stop = True   # audio generator 종료
                         self._result_event.set()
                         return
+
+            # 스트림 정상 종료: responses 소진 후 final result가 없으면 non_voice 처리
+            # (음성이 너무 짧아서 Google STT가 인식 불가한 경우)
+            if not self._result_event.is_set():
+                print("[STT] Stream ended without final result → non_voice")
+                self._final_transcript = "non_voice"
+                self._result_event.set()
 
         except Exception as e:
             print(f"[STT] Error: {e}")
@@ -224,10 +232,6 @@ class GoogleSTTV2:
 
         for chunk in self._audio_source:
             if self._stop:
-                break
-            if not self._process_audio:
-                # VAD END 이후: 오디오 전송 중단 → request generator 종료
-                # Google STT 서버가 스트림 종료로 인식하고 final transcript 반환
                 break
             if not chunk:
                 continue
@@ -285,11 +289,11 @@ class GoogleSTTV2:
             SpeechEventType.SPEECH_ACTIVITY_END,
             SpeechEventType.END_OF_SINGLE_UTTERANCE,
         ):
-            print("[STT] VAD: Speech END / EOS — waiting for final transcript")
-            self.eos_done       = True
-            self._process_audio = False
-            # _stop은 설정하지 않음: 오디오 전송은 중단하되 response 루프는 계속 돌아야
-            # Google STT가 final transcript를 반환할 때까지 responses 이터레이터를 유지해야 함
+            print("[STT] VAD: Speech END — waiting for final transcript")
+            self.eos_done = True
+            # _process_audio / _stop은 건드리지 않음.
+            # TTS 에코 등 잡음으로 인한 false EOS가 발생해도 audio stream을 유지해
+            # 실제 발화를 계속 기다린다. 스트림 종료는 is_final 수신 시 _stop=True로 처리.
 
 
 def create_stt(credentials_dir: str = None) -> GoogleSTTV2:

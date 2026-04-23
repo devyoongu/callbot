@@ -62,7 +62,7 @@ def handle_call(call):
                     chat_rooms_id=int(cfg.ATHENA_CHAT_ROOMS_ID),
                     scenarios_id=cfg.ATHENA_SCENARIOS_ID,
                 )
-                thread_id = athena.start(uui=call_id, voc_types=["inquiry"])
+                thread_id = athena.start(uui=call_id, voc_types=[])
                 if thread_id:
                     info     = athena.get_init_info()
                     greeting = info.get("greeting_message") or greeting
@@ -85,6 +85,10 @@ def handle_call(call):
 
         while call.state == CallState.ANSWERED:
             logger.info(f"[{call_id[:8]}] Turn {dialog_count}: Listening...")
+
+            # TTS 에코 소거: 직전 TTS 재생 후 RTP 버퍼에 남은 에코를 버린다.
+            # 0.5초간 오디오를 읽되 STT에 전달하지 않음.
+            _drain_audio(call, seconds=0.5)
 
             # 3a. STT 스트리밍 청취
             audio_src = CallAudioSource(call, timeout_sec=cfg.LISTEN_TIMEOUT_SEC)
@@ -143,7 +147,7 @@ def handle_call(call):
             )
 
             if reply_parts:
-                full_reply = " ".join(reply_parts)
+                full_reply = "".join(reply_parts)
                 logger.info(f"[{call_id[:8]}] Reply: {full_reply[:60]}...")
                 _play_tts(call, full_reply)
 
@@ -185,6 +189,25 @@ def handle_call(call):
         logger.info(f"[{call_id[:8]}] Call ended (turns={dialog_count})")
 
 
+def _drain_audio(call, seconds: float = 0.5):
+    """
+    TTS 재생 직후 RTP 에코 소거용 오디오 버퍼 드레인
+
+    pyVoIP의 RTP 수신 버퍼를 비워 이전 TTS 에코가 STT에 유입되지 않도록 합니다.
+    read_audio()로 실제 읽되 데이터는 버립니다.
+    """
+    from pyVoIP.VoIP import CallState
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if call.state != CallState.ANSWERED:
+            break
+        try:
+            call.read_audio(160, False)
+        except Exception:
+            break
+        time.sleep(0.01)
+
+
 def _play_tts(call, text: str):
     """
     TTS 합성 후 pyVoIP writeAudio()로 재생
@@ -205,11 +228,13 @@ def _play_tts(call, text: str):
     silence    = b"\x80" * CHUNK_SIZE
 
     # RTP 스트림 프라이밍: 무음 0.5초 전송으로 RTP 경로 개통
+    # 프라이밍 중에도 수신 버퍼 드레인 (에코 누적 방지)
     for _ in range(25):
         if call.state != CallState.ANSWERED:
             return
         try:
             call.writeAudio(silence)
+            call.read_audio(160, False)  # 수신 버퍼 실시간 소거
         except Exception:
             return
         time.sleep(SLEEP_SEC)
@@ -237,6 +262,7 @@ def _play_tts(call, text: str):
 
         try:
             call.writeAudio(chunk)
+            call.read_audio(160, False)  # TTS 재생 중 에코 실시간 소거
             sent += 1
         except Exception as e:
             logger.warning(f"[TTS] writeAudio error: {e}")
