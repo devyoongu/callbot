@@ -39,19 +39,32 @@ class MockCall:
       call.read_audio(160, False)   → 8kHz 8-bit unsigned PCM 160 bytes
     """
 
-    def __init__(self, pcm_8bit_unsigned: bytes, post_silence_reads: int = 60):
+    def __init__(
+        self,
+        pcm_8bit_unsigned: bytes,
+        post_silence_reads: int = 60,
+        pre_silence_reads: int = 0,
+    ):
         """
         Args:
             pcm_8bit_unsigned: 8kHz 8-bit unsigned PCM (pyVoIP 포맷)
             post_silence_reads: 오디오 소진 후 ENDED 전환까지 무음 반환 횟수
                                  60회 × 20ms = 1.2초 무음 후 종료
+            pre_silence_reads: WAV 음성 시작 전 선행 무음 반환 횟수.
+                                handle_call에서 drain은 제거됐지만,
+                                TTS 재생 → 첫 턴 진입까지의 비-실시간 구간에
+                                무음을 보내 호환성을 유지하기 위함.
         """
         self._data               = pcm_8bit_unsigned
         self._pos                = 0
         self._post_silence       = 0
         self._post_silence_limit = post_silence_reads
+        self._pre_silence        = pre_silence_reads
         self._state              = CallState.ANSWERED
         self._lock               = threading.Lock()
+        # handle_call의 hole-punch 루프가 0회 반복되도록 빈 리스트 노출
+        self.RTPClients          = []
+        self._tts_chunks_written = 0
 
     @property
     def state(self):
@@ -61,9 +74,12 @@ class MockCall:
     def read_audio(self, num_bytes: int, blocking: bool) -> bytes:
         """
         160 bytes의 8-bit unsigned PCM 반환.
-        오디오 소진 후 무음(0x80)을 반환하다가 post_silence_limit 초과 시 ENDED 전환.
+        선행 무음 → 실제 데이터 → 후행 무음 → ENDED 순.
         """
         with self._lock:
+            if self._pre_silence > 0:
+                self._pre_silence -= 1
+                return b"\x80" * num_bytes
             if self._pos < len(self._data):
                 chunk = self._data[self._pos:self._pos + num_bytes]
                 self._pos += num_bytes
@@ -75,6 +91,17 @@ class MockCall:
                 if self._post_silence >= self._post_silence_limit:
                     self._state = CallState.ENDED
                 return b"\x80" * num_bytes
+
+    def answer(self):
+        pass
+
+    def hangup(self):
+        with self._lock:
+            self._state = CallState.ENDED
+
+    def writeAudio(self, chunk: bytes):
+        # TTS 출력은 mock에서 swallow — 통계용 카운터만 증가
+        self._tts_chunks_written += 1
 
 
 # ── 오디오 변환 ────────────────────────────────────────────────────────────────

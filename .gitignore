@@ -3,3 +3,5 @@ crendential/
 .env
 .claude
 .idea
+wav/_dump/
+__pycache__/

@@ -87,8 +87,10 @@ def handle_call(call):
         while call.state == CallState.ANSWERED:
             logger.info(f"[{call_id[:8]}] Turn {dialog_count}: Listening...")
 
-            # TTS 에코 소거: pyVoIP 수신 버퍼가 빌 때까지 빠르게 드레인
-            _drain_rtp_buffer(call)
+            # TTS 직후 즉시 STT 시작 — pmin에 누적된 큐(에코 + 사용자 발화)를
+            # 통째로 받아 STT 버퍼에 쌓는다. 이전 _drain_rtp_buffer는 silence streak를
+            # 기다리느라 사용자 발화를 통째로 삼키는 부작용이 있어 제거.
+            # 에코는 _has_interim_content 가드(stt.py)가 VAD 단계에서 필터링.
 
             # 3a. STT 스트리밍 청취
             audio_src = CallAudioSource(call, timeout_sec=cfg.LISTEN_TIMEOUT_SEC)
@@ -294,45 +296,6 @@ def _poll_stt_result(
             stt._transcript_ready.clear()
 
     return False, "non_voice"
-
-
-def _drain_rtp_buffer(call, max_sec: float = 8.0, min_sec: float = 0.15):
-    """
-    TTS 재생 후 에코 소거: pyVoIP 수신 버퍼가 빌 때까지 드레인
-
-    robi-t-callbot prepare_for_recording() 패턴 적용:
-      - min_sec 동안 무조건 드레인 (TTS 잔여 에코 완전 소거)
-      - 연속 16회 무음(≈320ms) 감지 후 min_sec 경과 시 종료
-      - 드레인 완료 후 0.2s 안정화 대기 → STT 시작
-
-    max_sec=8.0: 긴 TTS(10-12초) 재생 후 에코가 3-5초 이상 지속될 수 있음.
-    silence 감지 시 조기 종료되므로 짧은 TTS 이후에는 빠르게 빠져나옴.
-    """
-    from pyVoIP.VoIP import CallState
-    _SILENCE = b"\x80" * 160
-    deadline     = time.time() + max_sec
-    min_deadline = time.time() + min_sec
-    silence_run  = 0
-    drained      = 0
-    while time.time() < deadline:
-        if call.state != CallState.ANSWERED:
-            break
-        try:
-            raw = call.read_audio(160, False)
-        except Exception:
-            break
-        if raw == _SILENCE:
-            silence_run += 1
-            # 최소 드레인 시간 경과 후 연속 16회 무음(≈320ms) = 버퍼 클리어
-            if silence_run >= 16 and time.time() >= min_deadline:
-                break
-        else:
-            silence_run = 0
-            drained += 1
-        time.sleep(0.005)   # 5ms — 1ms보다 CPU 친화적
-    logger.info(f"[Drain] {drained} echo chunks cleared, silence_run={silence_run}")
-    # 버퍼 클리어 후 스트림 안정화 대기 (robi-t-callbot prepare_for_recording 0.2s 패턴)
-    time.sleep(0.2)
 
 
 def _play_tts(call, text: str):

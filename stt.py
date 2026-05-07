@@ -293,25 +293,43 @@ class GoogleSTTV2:
         VAD_FRAME_SIZE    = 640   # 20ms frame at 16kHz (640 bytes = 320 samples × 2)
         RMS_THRESHOLD     = 200   # robi-t-callbot 동일 (노이즈 < 192, 발화 > 1886)
         SILENCE_THRESHOLD = 5     # 5 × 125ms = 625ms — robi-t-callbot 동일
+        EOS_FLUSH_CHUNKS  = 5     # EOS 트리거 후 추가로 흘릴 청크 수 (~625ms)
+                                  # gRPC를 즉시 끊으면 Google이 final을 못 보내고
+                                  # 스트림이 종료되어 non_voice 폴백되는 문제 회피.
 
         speech_detected   = False
         silence_frames    = 0
         high_energy_count = 0
+        flush_remaining   = 0     # >0 이면 VAD 평가 건너뛰고 그대로 흘려보냄
 
         for chunk in self._audio_source:
             if self._stop:
                 break
 
-            # EOS 커밋 후 즉시 종료 (flush 없음 — robi-t-callbot 패턴)
-            # gRPC가 clean end-of-stream 전송 → Google이 버퍼된 오디오로 is_final 반환
+            # EOS 커밋 후 종료 (flush 5청크 완료 후에만 _process_audio=False가 됨)
             if not self._process_audio:
                 break
 
             if not chunk:
                 continue
 
+            # ── EOS flush 진행 중: VAD 무시하고 그대로 yield ─────────────────
+            # 이 단계는 audio_src.stop()이 아직 호출되지 않은 상태에서만 동작.
+            # (외부 폴링 루프는 eos_done이 세트돼야 stop을 호출하므로,
+            #  flush 동안 audio_src는 계속 청크를 yield 한다.)
+            if flush_remaining > 0:
+                flush_remaining -= 1
+                yield cloud_speech_types.StreamingRecognizeRequest(audio=chunk)
+                if flush_remaining == 0:
+                    print(f"[STT] Client VAD: EOS flush done — committing")
+                    self.eos_done       = True
+                    self.eos_time       = time.time()
+                    self._process_audio = False
+                    break
+                continue
+
             # ── Client-side VAD (robi-t-callbot 패턴) ──────────────────────────
-            # WebRTC VAD + RMS 이중 판단으로 발화 감지 및 EOS 커밋.
+            # WebRTC VAD + RMS 이중 판단으로 발화 감지 및 EOS 트리거.
             # server VAD가 이미 EOS를 커밋했으면 (eos_done=True) 건너뜀.
             if vad and len(chunk) == 4000 and not self.eos_done:
                 is_speech = self._client_vad_check(vad, chunk, VAD_FRAME_SIZE, RMS_THRESHOLD)
@@ -330,12 +348,11 @@ class GoogleSTTV2:
                         silence_frames += 1
                         if silence_frames >= SILENCE_THRESHOLD:
                             if self._has_interim_content:
-                                # Google interim 확인 → EOS 커밋 후 즉시 종료
-                                print("[STT] Client VAD: EOS (625ms silence)")
-                                self.eos_done       = True
-                                self.eos_time       = time.time()
-                                self._process_audio = False
-                                break  # 즉시 종료 (robi-t-callbot 패턴)
+                                # 625ms 무음 + interim 존재 → flush 단계 진입.
+                                # 즉시 break하지 않고 5청크(~625ms)를 더 흘려서
+                                # Google이 is_final을 emit할 시간을 확보한다.
+                                print(f"[STT] Client VAD: EOS triggered (625ms silence) — flushing {EOS_FLUSH_CHUNKS} more chunks")
+                                flush_remaining = EOS_FLUSH_CHUNKS
                             else:
                                 # interim 없음 = echo/noise → 리셋 후 계속 청취
                                 print("[STT] Client VAD: 625ms silence, no interim — echo reset")
