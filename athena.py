@@ -181,12 +181,19 @@ class AthenaClient:
                     except Exception as e:
                         print(f"[Athena] query parse error: {e} | line: {line}")
 
-    def query_sync(self, text: str, dialog_count: int = 0) -> list:
+    def query_sync(self, text: str, dialog_count: int = 0, on_event=None) -> list:
         """
         query()의 동기 래퍼 — callbot 스레드에서 사용
 
         asyncio.run()으로 이벤트 루프를 생성하고 전체 응답을 수집합니다.
         (각 통화는 독립 프로세스/스레드이므로 기존 이벤트 루프 없음)
+
+        Args:
+            text:         사용자 발화
+            dialog_count: 대화 턴 인덱스 (로깅용)
+            on_event:     이벤트 도착 시 호출되는 콜백 (event_dict) -> None.
+                          메타 상태(meta_status)를 stream 즉시 TTS 재생 등에 사용.
+                          콜백이 블로킹하면 SSE 소비도 그만큼 지연됨.
 
         Returns:
             list of event dicts
@@ -196,6 +203,11 @@ class AthenaClient:
             async for event in self.query(text, dialog_count):
                 events.append(event)
                 print(f"[Athena] Event: {event['type']} — {event.get('text', '')[:50]}")
+                if on_event is not None:
+                    try:
+                        on_event(event)
+                    except Exception as e:
+                        print(f"[Athena] on_event callback error: {e}")
             return events
 
         return asyncio.run(_collect())

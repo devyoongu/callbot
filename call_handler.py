@@ -128,9 +128,23 @@ def handle_call(call):
             no_input_count = 0
 
             # 3c. Athena LLM 질의
+            #     meta_status 이벤트는 본 답변(reply) 도착 전에 오는 짧은 안내 멘트
+            #     (예: "확인하고 답변드리겠습니다.") — stream 도착 즉시 캐시된 TTS로
+            #     재생해 dead-air를 줄인다. 종류가 2~3개로 한정되어 캐시 적중률 ~100%.
             if athena:
+                reply_started = [False]
+
+                def on_event(event):
+                    etype = event.get("type")
+                    text  = event.get("text", "")
+                    if etype == "meta_status" and text and not reply_started[0]:
+                        logger.info(f"[{call_id[:8]}] Athena meta_status → TTS: {text!r}")
+                        _play_tts(call, text)
+                    elif etype in ("reply", "command"):
+                        reply_started[0] = True
+
                 try:
-                    events = athena.query_sync(transcript, dialog_count)
+                    events = athena.query_sync(transcript, dialog_count, on_event=on_event)
                 except Exception as e:
                     logger.error(f"[{call_id[:8]}] Athena query error: {e}")
                     events = [{"type": "reply", "text": cfg.FALLBACK_GOODBYE}]
