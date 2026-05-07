@@ -29,7 +29,7 @@ from call_handler import handle_call
 # ── 로깅 설정 ──────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s [%(threadName)s]: %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
     ]

@@ -4,6 +4,7 @@ callbot/tts.py — Google Cloud Text-to-Speech 핸들러
 google-stt-tts-guide.md 의 GoogleTTS 클래스 기반.
 synthesize_pcm_8k(): 텍스트 → 8kHz PCM (pyVoIP writeAudio 전달용)
 """
+import audioop
 import hashlib
 import struct
 import wave
@@ -320,3 +321,17 @@ def synthesize_pcm_8k(text: str) -> bytes:
     except Exception as e:
         print(f"[TTS] Cache save failed: {e}")
     return pcm_8k
+
+
+def synthesize_pcm_8bit_unsigned(text: str) -> bytes:
+    """
+    텍스트 → 8kHz 8-bit unsigned PCM (pyVoIP writeAudio 직접 입력 포맷).
+
+    내부적으로 synthesize_pcm_8k()(16-bit signed)를 호출 후
+    audioop.lin2lin(2,1) → audioop.bias(1,128) 으로 변환.
+    캐시 적중 시 합성 ~0ms.
+    """
+    pcm_16bit = synthesize_pcm_8k(text)
+    pcm_8bit  = audioop.lin2lin(pcm_16bit, 2, 1)   # 16-bit → 8-bit signed
+    pcm_8bit  = audioop.bias(pcm_8bit, 1, 128)     # signed → unsigned
+    return pcm_8bit
