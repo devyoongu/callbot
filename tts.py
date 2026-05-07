@@ -4,7 +4,11 @@ callbot/tts.py — Google Cloud Text-to-Speech 핸들러
 google-stt-tts-guide.md 의 GoogleTTS 클래스 기반.
 synthesize_pcm_8k(): 텍스트 → 8kHz PCM (pyVoIP writeAudio 전달용)
 """
+import hashlib
 import struct
+import wave
+from pathlib import Path
+
 import numpy as np
 from typing import Iterator, Optional
 
@@ -230,6 +234,10 @@ def _chunk_text(text: str, min_chars: int = 10, max_chars: int = 200) -> list:
 
 _tts_instance: Optional[GoogleTTS] = None
 
+# 인사말/Fallback 등 자주 쓰는 텍스트는 한 번 합성 후 8kHz WAV로 캐시.
+# 같은 텍스트+같은 voice 조합이면 GCP 호출 없이 디스크에서 즉시 로드.
+_CACHE_DIR = Path("wav/_cache")
+
 
 def _get_tts() -> GoogleTTS:
     """프로세스 내 TTS 싱글톤 (통화 내 재사용)"""
@@ -243,13 +251,72 @@ def _get_tts() -> GoogleTTS:
     return _tts_instance
 
 
+def _cache_key(text: str, voice_name: str) -> str:
+    h = hashlib.sha256()
+    h.update(voice_name.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(text.encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def is_tts_cached(text: str) -> bool:
+    """현재 voice 기준으로 text가 디스크에 캐시돼 있는지 미리 확인 (재생 로그용)."""
+    if not text:
+        return False
+    tts        = _get_tts()
+    cache_path = _CACHE_DIR / f"{_cache_key(text, tts.voice_name)}.wav"
+    return cache_path.exists()
+
+
+def _load_cached_pcm_8k(cache_path: Path) -> Optional[bytes]:
+    if not cache_path.exists():
+        return None
+    try:
+        with wave.open(str(cache_path), "rb") as wf:
+            if (wf.getframerate() != 8000
+                    or wf.getsampwidth() != 2
+                    or wf.getnchannels() != 1):
+                return None
+            return wf.readframes(wf.getnframes())
+    except Exception as e:
+        print(f"[TTS] Cache load failed for {cache_path.name}: {e}")
+        return None
+
+
+def _save_pcm_8k_as_wav(pcm: bytes, cache_path: Path):
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    with wave.open(str(tmp), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(8000)
+        wf.writeframes(pcm)
+    tmp.replace(cache_path)
+
+
 def synthesize_pcm_8k(text: str) -> bytes:
     """
     텍스트 → 8kHz 16-bit mono PCM
 
     pyVoIP call.writeAudio() 에 직접 전달 가능한 포맷.
     24kHz TTS 출력을 3x 다운샘플하여 8kHz로 변환합니다.
+
+    캐시: wav/_cache/{hash16}.wav 에 저장. text+voice 해시가 같으면
+    GCP TTS를 호출하지 않고 디스크에서 즉시 로드.
     """
-    tts     = _get_tts()
+    tts        = _get_tts()
+    cache_path = _CACHE_DIR / f"{_cache_key(text, tts.voice_name)}.wav"
+
+    cached = _load_cached_pcm_8k(cache_path)
+    if cached is not None:
+        print(f"[TTS] Cache hit: {cache_path.name} ({len(cached)} bytes) — {text[:30]!r}")
+        return cached
+
     pcm_24k = tts.synthesize(text)
-    return downsample_24k_to_8k(pcm_24k)
+    pcm_8k  = downsample_24k_to_8k(pcm_24k)
+    try:
+        _save_pcm_8k_as_wav(pcm_8k, cache_path)
+        print(f"[TTS] Cached: {cache_path.name} ({len(pcm_8k)} bytes) — {text[:30]!r}")
+    except Exception as e:
+        print(f"[TTS] Cache save failed: {e}")
+    return pcm_8k

@@ -4,4 +4,5 @@ crendential/
 .claude
 .idea
 wav/_dump/
+wav/_cache/
 __pycache__/

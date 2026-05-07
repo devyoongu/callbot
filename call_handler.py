@@ -13,7 +13,7 @@ from typing import Tuple
 import config as cfg
 from audio_source import CallAudioSource
 from stt import GoogleSTTV2, create_stt
-from tts import synthesize_pcm_8k
+from tts import synthesize_pcm_8k, is_tts_cached
 from athena import AthenaClient
 
 logger = logging.getLogger("callbot")
@@ -327,6 +327,7 @@ def _play_tts(call, text: str):
             return
         time.sleep(SLEEP_SEC)
 
+    cached = is_tts_cached(text)
     try:
         pcm_16k = synthesize_pcm_8k(text)  # 16-bit signed PCM at 8kHz
     except Exception as e:
@@ -337,7 +338,11 @@ def _play_tts(call, text: str):
     pcm_8bit = audioop.lin2lin(pcm_16k, 2, 1)    # 16-bit → 8-bit signed
     pcm_8bit = audioop.bias(pcm_8bit, 1, 128)     # signed → unsigned (0~255)
 
-    logger.info(f"[TTS] Playing {len(pcm_8bit)} bytes ({len(pcm_8bit)//160} chunks): {text[:40]!r}")
+    source = "CACHED" if cached else "FRESH"
+    logger.info(
+        f"[TTS] Playing [{source}] {len(pcm_8bit)} bytes "
+        f"({len(pcm_8bit)//160} chunks): {text[:40]!r}"
+    )
     sent = 0
     for i in range(0, len(pcm_8bit), CHUNK_SIZE):
         if call.state != CallState.ANSWERED:
