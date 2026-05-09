@@ -143,7 +143,22 @@ class TTSPipeline:
         with self._inflight_lock:
             self._inflight += 1
             self._idle_event.clear()
+        submit_t = time.time()
         future = self.executor.submit(synthesize_pcm_8bit_unsigned, text)
+
+        # 합성 완료 시각을 별도 라인으로 로깅 → server.py SSE 가 'tts_synth'
+        # 이벤트로 브라우저에 push, 해당 bubble 에 synth latency 표시.
+        # 캐시 적중 시 ~0ms, 신규 합성 시 수백 ms.
+        def _on_synth_done(fut, _text=text, _kind=kind):
+            if fut.cancelled() or fut.exception() is not None:
+                return
+            synth_ms = (time.time() - submit_t) * 1000
+            kind_str = f", kind={_kind}" if _kind else ""
+            logger.info(
+                f"[{self.call_id[:8]}] TTS synth done: {_text[:60]!r} "
+                f"(synth={synth_ms:.0f}ms{kind_str})"
+            )
+        future.add_done_callback(_on_synth_done)
         self.queue.put((text, future))
 
     def wait_drained(self, timeout: float = 60.0) -> bool:
