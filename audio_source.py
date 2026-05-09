@@ -77,6 +77,14 @@ class CallAudioSource:
         """
         16kHz PCM 청크를 yield하는 generator.
         STT 클래스의 _audio_generator()가 별도 스레드에서 이 이터러블을 소비합니다.
+
+        Leading-silence 스킵: 첫 non-silence 가 도착하기 전까지는 STT 로 chunk
+        를 보내지 않는다. WebRTC→Asterisk→pyVoIP 경로에서 RTP 가 늦게 도착할 때
+        leading silence padding 이 Google STT 의 인식 컨텍스트를 손상시켜
+        음소를 잘못 매칭하던 현상을 차단. 트레일링/중간 silence 는 그대로
+        유지해 Google STT 의 stream 을 keepalive (silence-skip 을 모든 구간에
+        하면 409 "Stream timed out after receiving no more client requests"
+        에러 발생).
         """
         from pyVoIP.VoIP import CallState
 
@@ -85,7 +93,10 @@ class CallAudioSource:
 
         total_reads      = 0
         non_empty_reads  = 0
-        first_audio_logged = False
+        # 첫 non-silence 도착 전엔 STT 로의 yield 를 보류한다.
+        # _dump_8k 에는 leading silence 도 그대로 기록 (네트워크 진단용),
+        # _dump_16k / yield 는 started 이후만 (STT 가 본 것 그대로).
+        started = False
 
         while not self._stop_event.is_set() and time.time() < deadline:
             # 통화가 끊어지면 종료
@@ -96,8 +107,7 @@ class CallAudioSource:
             if state != CallState.ANSWERED:
                 break
 
-            # non-blocking read: 무음도 STT에 전달해 Google STT 스트림 유지
-            # (blocking=True이면 무음 구간에서 generator가 멈춰 409 타임아웃 발생)
+            # non-blocking read: 패킷이 늦으면 _SILENCE_160 패딩 반환.
             try:
                 raw = self._call.read_audio(160, False)
             except Exception as e:
@@ -109,26 +119,35 @@ class CallAudioSource:
 
             if not is_silence:
                 non_empty_reads += 1
-                if not first_audio_logged:
-                    print(f"[AudioSource] First audio received ({len(raw)} bytes) after {total_reads} reads")
-                    first_audio_logged = True
-
-            # 2초 후에도 실제 오디오가 전혀 없으면 경고 (RTP 미수신 진단)
-            if total_reads == 100 and non_empty_reads == 0:
-                print(f"[AudioSource] WARNING: No RTP audio received after {total_reads} reads — "
-                      f"check Asterisk pjsip.conf direct_media setting")
+                if not started:
+                    print(f"[AudioSource] First audio received ({len(raw)} bytes) after {total_reads} reads — STT streaming begins")
+                    started = True
 
             # 8-bit unsigned → 16-bit signed 변환 (pyVoIP parse_pcmu width=1 역변환)
             raw_signed = audioop.bias(raw, 1, -128)      # 0~255 → -128~127
             raw_16bit  = audioop.lin2lin(raw_signed, 1, 2)  # 8-bit → 16-bit signed
-            self._buffer += raw_16bit
 
+            # 진단 dump 8k: 네트워크 RTP 타이밍 그대로 (leading silence 포함)
             if self._dump_enabled:
                 self._dump_8k.extend(raw_16bit)
 
-            # 1초 주기 진단 로그 — 정수값으로 raw 바이트와 16-bit 변환 결과 동시 표시
+            # 1초 주기 진단 로그
             if total_reads % _LOG_EVERY_N_READS == 0:
                 self._log_audio_stats(raw, raw_16bit, total_reads)
+
+            # 첫 audio 도착 전: STT 입력 버퍼/yield 보류, 짧은 대기 후 다음 read.
+            if not started:
+                if total_reads == 100 and non_empty_reads == 0:
+                    print(f"[AudioSource] WARNING: No RTP audio received after {total_reads} reads — "
+                          f"check Asterisk pjsip.conf direct_media setting")
+                if is_silence:
+                    time.sleep(0.01)
+                continue
+
+            # 첫 audio 이후: 정상 누적 + yield (트레일링 silence 도 STT 에 흘려보냄).
+            # 모든 silence 를 skip 하면 Google STT 가 client request 부재로
+            # 409 timeout 이 발생함 — 그래서 트레일링 silence 는 keepalive 로 유지.
+            self._buffer += raw_16bit
 
             # 2000 bytes (125ms at 8kHz 16-bit) 누적 시 업샘플 후 yield
             while len(self._buffer) >= _TARGET_8K_BYTES:
@@ -143,7 +162,7 @@ class CallAudioSource:
             if is_silence:
                 time.sleep(0.01)
 
-        print(f"[AudioSource] Done: {non_empty_reads}/{total_reads} reads had audio")
+        print(f"[AudioSource] Done: {non_empty_reads}/{total_reads} reads had audio (started={started})")
 
         if self._dump_enabled:
             self._save_dump_wavs()
