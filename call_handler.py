@@ -114,11 +114,27 @@ class TTSPipeline:
         )
         self.play_thread.start()
 
-    def enqueue(self, text: str):
+    def enqueue(self, text: str,
+                stt_to_bot_ms: Optional[float] = None,
+                kind: Optional[str] = None):
+        """
+        text: 합성/재생할 텍스트.
+        stt_to_bot_ms: 같은 turn 의 STT 완료 시각으로부터 이 enqueue 까지의
+                       경과 시간 (밀리초). 진단/UI 표시용.
+        kind: 'meta_first' / 'reply_first' / 'meta' / 'reply' 등. server.py SSE
+              가 이 값을 그대로 브라우저로 push 해 첫 안내멘트/첫 본답변 bubble
+              에만 latency annotation 을 그릴 수 있게 한다.
+        """
         text = (text or "").strip()
         if not text or self.stop_event.is_set():
             return
-        logger.info(f"[{self.call_id[:8]}] TTS enqueue: {text[:60]!r}")
+        extras = []
+        if stt_to_bot_ms is not None:
+            extras.append(f"stt_to_bot={stt_to_bot_ms:.0f}ms")
+        if kind is not None:
+            extras.append(f"kind={kind}")
+        suffix = f" ({', '.join(extras)})" if extras else ""
+        logger.info(f"[{self.call_id[:8]}] TTS enqueue: {text[:60]!r}{suffix}")
         # CALLBOT_TTS_DISABLED=1: 합성/재생 skip. 'TTS enqueue' 로그는 그대로
         # 남으므로 server.py SSE 가 봇 응답 텍스트는 정상 push (브라우저 chat
         # 에는 표시됨). STT 만 검증할 때 RTP 잡음/echo 제거 목적.
@@ -350,6 +366,11 @@ def handle_call(call):
             # 합성/재생은 pipeline 내부 worker 가 병렬로 진행. sentence N 재생 중
             # sentence N+1 이 미리 합성되어 gap 거의 0.
             athena_streamed = False
+            # turn 별 STT 완료 시각 — 첫 meta_status / 첫 reply 까지의 latency 계산용.
+            # stt.final_time 은 stt.py 가 is_final 도착 시 캡처. None 인 케이스 대비.
+            turn_stt_final_at  = stt.final_time or time.time()
+            meta_first_logged  = [False]
+            reply_first_logged = [False]
             if athena:
                 sentence_buffer = [""]
                 reply_started   = [False]
@@ -360,21 +381,35 @@ def handle_call(call):
                     if etype == "meta_status":
                         if text and not reply_started[0]:
                             logger.info(f"[{call_id[:8]}] Athena meta_status: {text!r}")
-                            pipeline.enqueue(text)
+                            kind = "meta_first" if not meta_first_logged[0] else "meta"
+                            stt_to_bot_ms = (time.time() - turn_stt_final_at) * 1000 \
+                                              if not meta_first_logged[0] else None
+                            meta_first_logged[0] = True
+                            pipeline.enqueue(text, stt_to_bot_ms=stt_to_bot_ms, kind=kind)
                         return
                     if etype in ("reply", "command") and text:
                         reply_started[0] = True
                         sentence_buffer[0] += text
                         while "||" in sentence_buffer[0]:
                             sentence, _, rest = sentence_buffer[0].partition("||")
-                            pipeline.enqueue(sentence)
+                            kind = "reply_first" if not reply_first_logged[0] else "reply"
+                            stt_to_bot_ms = (time.time() - turn_stt_final_at) * 1000 \
+                                              if not reply_first_logged[0] else None
+                            reply_first_logged[0] = True
+                            pipeline.enqueue(sentence, stt_to_bot_ms=stt_to_bot_ms, kind=kind)
                             sentence_buffer[0] = rest
 
                 try:
                     events = athena.query_sync(transcript, dialog_count, on_event=on_event)
-                    # stream 종료 후 buffer 잔여분(마지막 문장; "||" 미포함) enqueue
+                    # stream 종료 후 buffer 잔여분(마지막 문장; "||" 미포함) enqueue.
+                    # reply_first 가 아직 안 찍힌 경우 = 응답 전체가 한 문장 → 잔여분이 첫 응답.
                     if sentence_buffer[0].strip():
-                        pipeline.enqueue(sentence_buffer[0])
+                        kind = "reply_first" if not reply_first_logged[0] else "reply"
+                        stt_to_bot_ms = (time.time() - turn_stt_final_at) * 1000 \
+                                          if not reply_first_logged[0] else None
+                        reply_first_logged[0] = True
+                        pipeline.enqueue(sentence_buffer[0],
+                                         stt_to_bot_ms=stt_to_bot_ms, kind=kind)
                         sentence_buffer[0] = ""
                     athena_streamed = True
                 except Exception as e:
