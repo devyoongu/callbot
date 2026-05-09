@@ -310,7 +310,16 @@ def handle_call(call):
                 audio_src.stop()
                 stt.finalize()
 
-            logger.info(f"[{call_id[:8]}] STT result: success={success}, transcript={transcript!r}")
+            eos_to_final_str = ""
+            eos_t = stt.eos_time or stt.last_speech_end_time
+            if eos_t is not None and stt.final_time is not None:
+                eos_to_final_ms = (stt.final_time - eos_t) * 1000
+                src = "clientEOS" if stt.eos_time else "serverEND"
+                eos_to_final_str = f", {src}_to_final={eos_to_final_ms:.0f}ms"
+            logger.info(
+                f"[{call_id[:8]}] STT result: success={success}, "
+                f"transcript={transcript!r}{eos_to_final_str}"
+            )
 
             # 3b. 무음/인식 실패 처리
             if not success or transcript in ("non_voice", "", "timeout", "error"):

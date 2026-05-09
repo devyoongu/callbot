@@ -83,6 +83,10 @@ class GoogleSTTV2:
         self.speech_started_time: Optional[float] = None
         self.eos_done                 = False
         self.eos_time: Optional[float] = None
+        # 가장 최근 server VAD SPEECH_END 시각 — client VAD EOS 가 트리거되지 않은
+        # 경우 (Google STT 가 더 빨리 is_final 반환) latency 측정용 fallback.
+        self.last_speech_end_time: Optional[float] = None
+        self.final_time: Optional[float] = None  # is_final 도착 시각 (EOS→Final latency 계산용)
         self._process_audio           = True
         self._has_interim_content     = False
 
@@ -121,6 +125,8 @@ class GoogleSTTV2:
         self.speech_started_time      = None
         self.eos_done                 = False
         self.eos_time                 = None
+        self.last_speech_end_time     = None
+        self.final_time               = None
         self._has_interim_content     = False
         self._speech_started_consumed = False
         self._eos_consumed            = False
@@ -244,7 +250,16 @@ class GoogleSTTV2:
 
                     if result.is_final:
                         self._final_transcript = transcript.strip() or "non_voice"
-                        print(f"[STT] Final: '{self._final_transcript}'")
+                        self.final_time = time.time()
+                        # EOS 시각 우선순위: client VAD flush 완료 > server VAD 의 마지막 SPEECH_END.
+                        # 보통 Google STT 가 client VAD 보다 먼저 is_final 반환 → server END 시각 사용.
+                        eos_t = self.eos_time or self.last_speech_end_time
+                        latency_str = ""
+                        if eos_t is not None:
+                            latency_ms = (self.final_time - eos_t) * 1000
+                            src = "clientEOS" if self.eos_time else "serverEND"
+                            latency_str = f" ({src}→Final {latency_ms:.0f}ms)"
+                        print(f"[STT] Final: '{self._final_transcript}'{latency_str}")
                         self._stop = True
                         self._transcript_ready.set()
                         self._result_event.set()
@@ -401,6 +416,8 @@ class GoogleSTTV2:
                 # 서버 VAD는 단어 사이 쉬는 구간(~300ms)에도 END를 발화하여 문장이 잘림.
                 # generator를 멈추지 않고 계속 오디오 전송 — client VAD가 EOS 담당.
                 # (log 증거: END 직후 두 번째 BEGIN이 오는 것 = 사용자가 계속 말하는 중)
+                # latency 측정용으로 최신 END 시각만 기록 (마지막 END 가 진짜 EOS 후보).
+                self.last_speech_end_time = time.time()
                 print("[STT] VAD: Speech END — real speech, continuing (client VAD handles EOS)")
             else:
                 # interim 없음 = 에코/잡음 → speech_started 리셋 후 계속 청취
