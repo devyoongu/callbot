@@ -9,6 +9,7 @@ TTS 합성/재생은 TTSPipeline 클래스가 백그라운드 스레드에서 �
   - 합성 worker(executor)와 재생 worker(play_thread)가 병렬 동작
   - call 단위 lifecycle: handle_call 진입 시 1회 생성, finally에서 1회 shutdown
 """
+import os
 import queue
 import threading
 import time
@@ -118,6 +119,11 @@ class TTSPipeline:
         if not text or self.stop_event.is_set():
             return
         logger.info(f"[{self.call_id[:8]}] TTS enqueue: {text[:60]!r}")
+        # CALLBOT_TTS_DISABLED=1: 합성/재생 skip. 'TTS enqueue' 로그는 그대로
+        # 남으므로 server.py SSE 가 봇 응답 텍스트는 정상 push (브라우저 chat
+        # 에는 표시됨). STT 만 검증할 때 RTP 잡음/echo 제거 목적.
+        if os.environ.get("CALLBOT_TTS_DISABLED") == "1":
+            return
         with self._inflight_lock:
             self._inflight += 1
             self._idle_event.clear()
