@@ -136,12 +136,15 @@ class CallAudioSource:
                 self._log_audio_stats(raw, raw_16bit, total_reads)
 
             # 첫 audio 도착 전: STT 입력 버퍼/yield 보류, 짧은 대기 후 다음 read.
+            # sleep 1ms (1000 reads/s) — 봇 TTS 재생 중 누적된 silence 패킷
+            # (turn 18s × 50pps = ~900) 을 빠르게 비워야 user audio 가 timeout
+            # 안에 도달. 10ms (100 reads/s) 면 9초 소요되어 first audio 가 늦음.
             if not started:
                 if total_reads == 100 and non_empty_reads == 0:
                     print(f"[AudioSource] WARNING: No RTP audio received after {total_reads} reads — "
                           f"check Asterisk pjsip.conf direct_media setting")
                 if is_silence:
-                    time.sleep(0.01)
+                    time.sleep(0.001)
                 continue
 
             # 첫 audio 이후: 정상 누적 + yield (트레일링 silence 도 STT 에 흘려보냄).
