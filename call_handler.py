@@ -383,9 +383,9 @@ def handle_call(call):
             # 기다리느라 사용자 발화를 통째로 삼키는 부작용이 있어 제거.
             # 에코는 _has_interim_content 가드(stt.py)가 VAD 단계에서 필터링.
 
-            # 3a. STT 스트리밍 청취
-            audio_src = CallAudioSource(call, timeout_sec=cfg.LISTEN_TIMEOUT_SEC)
+            # 3a. STT 스트리밍 청취 — STT 먼저 만들어 sample_rate 결정 후 audio_src 에 전달
             stt       = create_stt(cfg.CREDENTIALS_DIR)
+            audio_src = CallAudioSource(call, timeout_sec=cfg.LISTEN_TIMEOUT_SEC, sample_rate=stt.sample_rate)
 
             try:
                 stt.initialize()

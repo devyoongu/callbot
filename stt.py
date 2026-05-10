@@ -39,7 +39,8 @@ class GoogleSTTV2:
     """
 
     # 모델별 설정
-    # telephony: 전화 품질 오디오 최적화 (16kHz로 업샘플된 8kHz 전화음 입력)
+    # telephony: 전화 품질 오디오 최적화 (narrowband, 8kHz native 입력)
+    # chirp_3:   wideband (16kHz)
     MODEL_CONFIG = {
         "chirp_3": {
             "region": "us",
@@ -49,7 +50,7 @@ class GoogleSTTV2:
         "telephony": {
             "region": "global",
             "endpoint": "speech.googleapis.com",
-            "sample_rate": 16000,  # 8kHz를 2x 업샘플해서 입력
+            "sample_rate": 8000,  # 모델 훈련 분포와 일치 — upsample 시 4–8kHz 가 0-에너지로 차서 분포 어긋남
         },
     }
 
@@ -305,8 +306,10 @@ class GoogleSTTV2:
         if WEBRTC_VAD_AVAILABLE:
             vad = webrtcvad.Vad(2)
 
-        VAD_FRAME_SIZE    = 640   # 20ms frame at 16kHz (640 bytes = 320 samples × 2)
-        RMS_THRESHOLD     = 200   # robi-t-callbot 동일 (노이즈 < 192, 발화 > 1886)
+        # 16-bit PCM 기준. sample_rate 따라 byte 수가 달라지므로 동적 계산.
+        EXPECTED_CHUNK_BYTES = int(self.sample_rate * 0.125 * 2)  # 125ms 청크 — 2000@8k / 4000@16k
+        VAD_FRAME_SIZE       = int(self.sample_rate * 0.020 * 2)  # 20ms 프레임 — 320@8k / 640@16k
+        RMS_THRESHOLD     = 200   # robi-t-callbot 동일 (노이즈 < 192, 발화 > 1886). 진폭 기준이라 sr 무관.
         SILENCE_THRESHOLD = 5     # 5 × 125ms = 625ms — robi-t-callbot 동일
         EOS_FLUSH_CHUNKS  = 5     # EOS 트리거 후 추가로 흘릴 청크 수 (~625ms)
                                   # gRPC를 즉시 끊으면 Google이 final을 못 보내고
@@ -346,7 +349,7 @@ class GoogleSTTV2:
             # ── Client-side VAD (robi-t-callbot 패턴) ──────────────────────────
             # WebRTC VAD + RMS 이중 판단으로 발화 감지 및 EOS 트리거.
             # server VAD가 이미 EOS를 커밋했으면 (eos_done=True) 건너뜀.
-            if vad and len(chunk) == 4000 and not self.eos_done:
+            if vad and len(chunk) == EXPECTED_CHUNK_BYTES and not self.eos_done:
                 is_speech = self._client_vad_check(vad, chunk, VAD_FRAME_SIZE, RMS_THRESHOLD)
 
                 if is_speech:

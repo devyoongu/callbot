@@ -5,18 +5,20 @@ pyVoIP call.read_audio() 는 8kHz 8-bit unsigned PCM을 160 bytes 단위로 반�
   - encode_pcmu/parse_pcmu 내부가 audioop width=1 (8-bit) 기준
   - 반환값: 0~255 unsigned (무음=0x80)
 
-GoogleSTTV2는 16kHz PCM 4000 bytes 청크를 기대합니다.
+GoogleSTTV2는 모델별 sample_rate 에 맞춘 PCM 청크를 기대합니다.
+  - telephony (8kHz native): 2000 bytes (125ms) 청크
+  - chirp_3   (16kHz):       4000 bytes (125ms) 청크
 
 이 클래스가 수행하는 변환:
   read_audio() (160 bytes, 8kHz 8-bit unsigned, non-blocking) →
   8-bit unsigned → 16-bit signed 변환 →
   2000 bytes (125ms, 8kHz 16-bit) 묶음 →
-  upsample_8k_to_16k() →
-  4000 bytes (125ms, 16kHz 16-bit) 청크 yield
+  sample_rate 가 16000 이면 upsample_8k_to_16k() (4000B), 8000 이면 그대로 (2000B) →
+  STT 청크 yield
 
 진단 옵션:
   - 1초 주기로 `[AudioSrc N=...]` 로그 출력 (정수값/RMS/peak/샘플 미리보기)
-  - DEBUG_DUMP_RTP=1 환경변수일 때 wav/_dump/turn_<ts>.wav 와 ..._16k.wav 덤프
+  - DEBUG_DUMP_RTP=1 환경변수일 때 wav/_dump/turn_<ts>_8k.wav 와 ..._<sr>k.wav 덤프
 """
 import audioop
 import math
@@ -53,21 +55,25 @@ class CallAudioSource:
         audio_src.stop()  # 외부에서 강제 종료 시
     """
 
-    def __init__(self, call, timeout_sec: int = 15):
+    def __init__(self, call, timeout_sec: int = 15, sample_rate: int = 16000):
         """
         Args:
             call: pyVoIP VoIPCall 인스턴스
             timeout_sec: 최대 청취 시간 (초). 초과 시 generator 종료.
+            sample_rate: STT 가 받을 sample rate. 8000 (telephony native) 또는 16000 (chirp_3).
+                         8000 이면 upsample 단계 skip — 모델 훈련 분포와 일치.
         """
         self._call        = call
         self._timeout_sec = timeout_sec
+        self._sample_rate = sample_rate
         self._stop_event  = threading.Event()
         self._buffer      = b""
 
         # 진단용 WAV 덤프 (DEBUG_DUMP_RTP=1)
+        # _dump_8k: 네트워크 RTP 그대로 (항상 8kHz). _dump_out: STT 가 본 데이터 (sample_rate 따라).
         self._dump_enabled = os.environ.get("DEBUG_DUMP_RTP") == "1"
         self._dump_8k      = bytearray() if self._dump_enabled else None
-        self._dump_16k     = bytearray() if self._dump_enabled else None
+        self._dump_out     = bytearray() if self._dump_enabled else None
 
     def stop(self):
         """generator 루프를 외부에서 종료"""
@@ -75,7 +81,7 @@ class CallAudioSource:
 
     def __iter__(self):
         """
-        16kHz PCM 청크를 yield하는 generator.
+        STT 모델 sample_rate 에 맞춘 PCM 청크를 yield 하는 generator.
         STT 클래스의 _audio_generator()가 별도 스레드에서 이 이터러블을 소비합니다.
 
         Leading-silence 스킵: 첫 non-silence 가 도착하기 전까지는 STT 로 chunk
@@ -152,14 +158,16 @@ class CallAudioSource:
             # 409 timeout 이 발생함 — 그래서 트레일링 silence 는 keepalive 로 유지.
             self._buffer += raw_16bit
 
-            # 2000 bytes (125ms at 8kHz 16-bit) 누적 시 업샘플 후 yield
+            # 2000 bytes (125ms at 8kHz 16-bit) 누적 시 sample_rate 따라 분기 yield.
+            # telephony (8k native): chunk_8k 그대로. chirp_3 (16k): 2x upsample → 4000B.
             while len(self._buffer) >= _TARGET_8K_BYTES:
                 chunk_8k = self._buffer[:_TARGET_8K_BYTES]
                 self._buffer = self._buffer[_TARGET_8K_BYTES:]
-                chunk_16k = upsample_8k_to_16k(chunk_8k)
+                chunk_out = (upsample_8k_to_16k(chunk_8k)
+                             if self._sample_rate == 16000 else chunk_8k)
                 if self._dump_enabled:
-                    self._dump_16k.extend(chunk_16k)
-                yield chunk_16k
+                    self._dump_out.extend(chunk_out)
+                yield chunk_out
 
             # 무음(RTP 미도착)이면 짧은 대기 (busy-loop 방지)
             if is_silence:
@@ -204,14 +212,15 @@ class CallAudioSource:
         )
 
     def _save_dump_wavs(self):
-        """DEBUG_DUMP_RTP=1 시 8kHz / 16kHz 두 버전 WAV 저장."""
-        if not self._dump_8k and not self._dump_16k:
+        """DEBUG_DUMP_RTP=1 시 RTP 8kHz 원본 + STT 입력 (sample_rate 따라) 두 버전 WAV 저장."""
+        if not self._dump_8k and not self._dump_out:
             return
         try:
             os.makedirs(_DUMP_DIR, exist_ok=True)
             ts        = int(time.time())
+            sr_khz    = self._sample_rate // 1000
             path_8k   = os.path.join(_DUMP_DIR, f"turn_{ts}.wav")
-            path_16k  = os.path.join(_DUMP_DIR, f"turn_{ts}_16k.wav")
+            path_out  = os.path.join(_DUMP_DIR, f"turn_{ts}_{sr_khz}k.wav")
 
             with wave.open(path_8k, "wb") as wf:
                 wf.setnchannels(1)
@@ -219,17 +228,17 @@ class CallAudioSource:
                 wf.setframerate(8000)
                 wf.writeframes(bytes(self._dump_8k))
 
-            with wave.open(path_16k, "wb") as wf:
+            with wave.open(path_out, "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
-                wf.setframerate(16000)
-                wf.writeframes(bytes(self._dump_16k))
+                wf.setframerate(self._sample_rate)
+                wf.writeframes(bytes(self._dump_out))
 
             dur_8k  = len(self._dump_8k)  / (8000 * 2)
-            dur_16k = len(self._dump_16k) / (16000 * 2)
+            dur_out = len(self._dump_out) / (self._sample_rate * 2)
             print(
                 f"[AudioSrc] Dumped: {path_8k} ({dur_8k:.2f}s 8k) | "
-                f"{path_16k} ({dur_16k:.2f}s 16k)"
+                f"{path_out} ({dur_out:.2f}s {sr_khz}k)"
             )
         except Exception as e:
             print(f"[AudioSrc] WAV dump failed: {e}")
