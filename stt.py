@@ -23,6 +23,7 @@ except ImportError:
 
 import numpy as np
 from credentials import load_google_credentials
+from stt_phrases import build_adaptation, supports_adaptation
 import config as cfg
 
 
@@ -214,7 +215,10 @@ class GoogleSTTV2:
                 f"projects/{self.project_id}/locations/{self.region}/recognizers/_"
             )
 
-            recognition_config = cloud_speech_types.RecognitionConfig(
+            # 도메인 phrase boost — adaptation 지원 모델 (chirp_3) 에만 주입.
+            # telephony global 은 V2 default recognizer 가 speech_adaptation_boost
+            # 미지원 (실측: "Recognizer does not support feature" 400 에러). 모델별 분기.
+            config_kwargs = dict(
                 explicit_decoding_config=cloud_speech_types.ExplicitDecodingConfig(
                     encoding=cloud_speech_types.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
                     sample_rate_hertz=self.sample_rate,
@@ -223,6 +227,10 @@ class GoogleSTTV2:
                 language_codes=[self.language],
                 model=self.model,
             )
+            if supports_adaptation(self.model):
+                config_kwargs["adaptation"] = build_adaptation()
+                print(f"[STT] adaptation enabled for model={self.model}")
+            recognition_config = cloud_speech_types.RecognitionConfig(**config_kwargs)
 
             # robi-t-callbot과 동일한 간단 설정 — VoiceActivityTimeout 미사용
             # (Google 기본값 사용, 커스텀 timeout이 오히려 부작용 유발 가능)

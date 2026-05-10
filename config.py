@@ -21,7 +21,7 @@ _LOCAL_IP       = os.getenv("LOCAL_IP", "")
 
 # ── Google Cloud ───────────────────────────────────────────────────────
 GCP_PROJECT_ID   = os.getenv("GCP_PROJECT_ID", "gen-lang-client-0665942228")
-GCP_STT_MODEL    = os.getenv("GCP_STT_MODEL", "telephony")
+GCP_STT_MODEL    = os.getenv("GCP_STT_MODEL", "chirp_3")
 GCP_STT_LANGUAGE = os.getenv("GCP_STT_LANGUAGE", "ko-KR")
 GCP_TTS_VOICE    = os.getenv("GCP_TTS_VOICE", "chirp3-hd-achernar")
 
