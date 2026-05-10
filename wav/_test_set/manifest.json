@@ -1,0 +1,32 @@
+[
+  {
+    "wav": "q1.wav",
+    "expected": "파견보안관제와 원격관제의 차이는 무엇인가요",
+    "captured_at": "2026-05-10T23:06 (Run D, chirp_3 + adaptation)",
+    "note": "도메인 복합어 두 개. baseline 인식률 매우 낮음."
+  },
+  {
+    "wav": "q2.wav",
+    "expected": "중소기업도 인증이 꼭 필요한가요",
+    "captured_at": "2026-05-10T23:07 (Run D)",
+    "note": "평탄 단문. 가끔 끝의 '가요' 가 잘림."
+  },
+  {
+    "wav": "q3.wav",
+    "expected": "제로트러스트 보안이란 무엇인가요",
+    "captured_at": "2026-05-10T23:07 (Run D)",
+    "note": "고유명사+'보안'. 종종 끝 잘림 및 어휘 substitution."
+  },
+  {
+    "wav": "q4.wav",
+    "expected": "랜섬웨어 사전 예방 방법은 무엇인가요",
+    "captured_at": "2026-05-10T23:08 (Run D)",
+    "note": "Run D 에서는 정상 인식. Run C3 에서는 사전→사장님 substitution 발생."
+  },
+  {
+    "wav": "q5.wav",
+    "expected": "얼굴인식기는 실외에도 설치 가능한가요",
+    "captured_at": "2026-05-10T23:08 (Run D)",
+    "note": "Run D 에서는 정상. baseline (telephony) 에서는 실외→시대 misrecog + 끝 잘림."
+  }
+]

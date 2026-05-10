@@ -89,6 +89,10 @@ class GoogleSTTV2:
         # 경우 (Google STT 가 더 빨리 is_final 반환) latency 측정용 fallback.
         self.last_speech_end_time: Optional[float] = None
         self.final_time: Optional[float] = None  # is_final 도착 시각 (EOS→Final latency 계산용)
+        # chirp_3 의 premature is_final 대응 — 첫 is_final 시 즉시 stop 하지 않고
+        # audio 를 더 흘려 후속 is_final 을 누적. _audio_generator 가 이 시각으로
+        # post-final grace timer 체크.
+        self._first_final_time: Optional[float] = None
         self._process_audio           = True
         self._has_interim_content     = False
 
@@ -143,6 +147,10 @@ class GoogleSTTV2:
         self._yielded_chunk_count     = 0
         self._vad_begin_count         = 0
         self._vad_end_count           = 0
+        self._first_final_time        = None
+        # 다중 stream 재시작 — chirp_3 의 premature finalization 우회용.
+        # _audio_generator 가 이 flag 를 보고 break → gRPC EOF → 새 stream 시작.
+        self._inner_stream_should_end = False
 
         self._audio_source = audio_source
         self._streaming_thread = threading.Thread(
@@ -210,6 +218,33 @@ class GoogleSTTV2:
     # ── 내부 구현 ─────────────────────────────────────────────────────
 
     def _run_streaming(self):
+        """
+        Multi-stream chirp_3 finalization fix —
+
+        chirp_3 는 발화 중간 짧은 휴지 만으로도 is_final 을 발행해 발화의 뒷부분이
+        통째로 잘림 (실측: "파견보안관제와 원격관제의 차이는 무엇인가요" → "파견
+        보안관제 원격"). VoiceActivityTimeout / enable_voice_activity_events 등
+        client 측 setting 으로는 우회 안 됨 — 모델 내부 EOS 판정.
+
+        해결: is_final 도착 시 stream 을 종료 (gRPC EOF) 하고 audio source 의
+        남은 청크로 새 streaming_recognize 시작. transcripts 누적 후 join.
+        audio source 는 한 번 생성된 generator 라 stream 사이에 iteration 위치가
+        보존됨 → 청크 손실 없이 발화 끝까지 전부 STT 처리.
+
+        outer 종료 조건:
+          (a) self._stop True (외부 호출자가 강제 종료)
+          (b) 한 stream 이 is_final 없이 자연 종료 (audio source 고갈)
+          (c) MAX_ITER 안전 한계 도달
+        """
+        # MAX_ITER=2 — 첫 stream + 1회 restart. 3번째 stream 은 보통 트레일링
+        # silence 만 처리해 환각 ("아.", "아니면 무엇입니까?") 만 추가하므로 차단.
+        MAX_ITER = 2
+        # 너무 짧은 final 은 환각/잡음 fragment 가능성 — 본문 누적 시 제외 (그러나
+        # 첫 결과 (단 1개 final만 있는 short utterance) 는 손실 방지 위해 항상 보존).
+        MIN_FRAGMENT_LEN = 3
+        transcripts: list[str] = []
+        iter_count = 0
+
         try:
             recognizer_path = (
                 f"projects/{self.project_id}/locations/{self.region}/recognizers/_"
@@ -232,101 +267,160 @@ class GoogleSTTV2:
                 print(f"[STT] adaptation enabled for model={self.model}")
             recognition_config = cloud_speech_types.RecognitionConfig(**config_kwargs)
 
-            # robi-t-callbot과 동일한 간단 설정 — VoiceActivityTimeout 미사용
-            # (Google 기본값 사용, 커스텀 timeout이 오히려 부작용 유발 가능)
             streaming_features = cloud_speech_types.StreamingRecognitionFeatures(
                 interim_results=True,
                 enable_voice_activity_events=self.use_server_vad,
             )
-
             streaming_config = cloud_speech_types.StreamingRecognitionConfig(
                 config=recognition_config,
                 streaming_features=streaming_features,
             )
 
-            config_request = cloud_speech_types.StreamingRecognizeRequest(
-                recognizer=recognizer_path,
-                streaming_config=streaming_config,
-            )
+            while not self._stop and iter_count < MAX_ITER:
+                iter_count += 1
+                self._inner_stream_should_end = False
+                stream_got_final = False
 
-            def requests_gen():
-                yield config_request
-                yield from self._audio_generator()
+                config_request = cloud_speech_types.StreamingRecognizeRequest(
+                    recognizer=recognizer_path,
+                    streaming_config=streaming_config,
+                )
 
-            responses = self.client.streaming_recognize(requests=requests_gen())
+                def requests_gen():
+                    yield config_request
+                    yield from self._audio_generator()
 
-            for response in responses:
-                if self._stop:
+                try:
+                    responses = self.client.streaming_recognize(requests=requests_gen())
+
+                    for response in responses:
+                        if self._stop:
+                            break
+
+                        for result in response.results:
+                            if not result.alternatives:
+                                continue
+                            transcript = result.alternatives[0].transcript
+
+                            if result.is_final:
+                                text = transcript.strip()
+                                if text and text != "non_voice":
+                                    # 첫 final 은 항상 보존 (전체 인식이 짧은 발화일
+                                    # 가능성). 2번째 이상은 MIN_FRAGMENT_LEN 미만이면
+                                    # 트레일링 silence 의 환각 가능성 높아 skip.
+                                    accept = (iter_count == 1) or (len(text) >= MIN_FRAGMENT_LEN)
+                                    if accept:
+                                        transcripts.append(text)
+                                    self.final_time = time.time()
+                                    if self._first_final_time is None:
+                                        self._first_final_time = self.final_time
+                                    eos_t = self.eos_time or self.last_speech_end_time
+                                    latency_str = ""
+                                    if eos_t is not None:
+                                        latency_ms = (self.final_time - eos_t) * 1000
+                                        src = "clientEOS" if self.eos_time else "serverEND"
+                                        latency_str = f" ({src}→Final {latency_ms:.0f}ms)"
+                                    skip_str = "" if accept else " [SKIP — 환각 의심]"
+                                    print(f"[STT] Final #{iter_count}: '{text}'{latency_str}{skip_str}")
+                                # is_final 도착 → 이 stream 을 종료시키고 새 stream 시작.
+                                stream_got_final = True
+                                self._inner_stream_should_end = True
+                                continue
+
+                            text_stripped = transcript.strip()
+                            if not text_stripped:
+                                continue
+                            if text_stripped != self._last_interim_text:
+                                tag = "1st" if not self._has_interim_content else "..."
+                                print(f"[STT] Interim ({tag}): '{text_stripped[:60]}'")
+                                self._last_interim_text = text_stripped
+                            if not self._has_interim_content:
+                                if not self.speech_started:
+                                    self.speech_started = True
+                                    self.speech_started_time = time.time()
+                            self._has_interim_content = True
+
+                        if self.use_server_vad and response.speech_event_type:
+                            self._handle_vad_event(response.speech_event_type)
+
+                    # stream 종료. is_final 없으면 audio source 고갈 — outer loop 도 종료.
+                    if not stream_got_final:
+                        if iter_count == 1:
+                            print(f"[STT] Stream #{iter_count} ended without is_final → non_voice")
+                        else:
+                            print(f"[STT] Stream #{iter_count} ended without is_final — done")
+                        break
+
+                except Exception as e:
+                    print(f"[STT] Stream #{iter_count} error: {e}")
+                    self._stt_error = str(e)
                     break
 
-                # ① results 먼저 처리 — interim이 있으면 _has_interim_content 설정
-                #    (VAD 이벤트보다 먼저 처리해야 같은 response에 SPEECH_END와
-                #     interim result가 함께 올 때 race condition이 없음)
-                for result in response.results:
-                    if not result.alternatives:
-                        continue
-                    transcript = result.alternatives[0].transcript
+            # 모든 stream 종료. transcripts 합치기 (공백 join).
+            # 동일 또는 prefix 중복 제거: chirp_3 가 가끔 같은 phrase 의 더 긴 버전을
+            # 다음 stream 에서 처음부터 재출력하기도 함.
+            joined = self._dedupe_join(transcripts)
 
-                    if result.is_final:
-                        self._final_transcript = transcript.strip() or "non_voice"
-                        self.final_time = time.time()
-                        # EOS 시각 우선순위: client VAD flush 완료 > server VAD 의 마지막 SPEECH_END.
-                        # 보통 Google STT 가 client VAD 보다 먼저 is_final 반환 → server END 시각 사용.
-                        eos_t = self.eos_time or self.last_speech_end_time
-                        latency_str = ""
-                        if eos_t is not None:
-                            latency_ms = (self.final_time - eos_t) * 1000
-                            src = "clientEOS" if self.eos_time else "serverEND"
-                            latency_str = f" ({src}→Final {latency_ms:.0f}ms)"
-                        print(f"[STT] Final: '{self._final_transcript}'{latency_str}")
-                        # turn 진단 summary — 첫 turn 잘림 분석용 한 줄.
-                        # VAD BEGIN/END count = 사용자가 발화 중 멈춘 횟수의 근사.
-                        # last_interim 보다 final 이 짧으면 STT 가 뒤를 쳐낸 것.
-                        audio_ms     = self._yielded_chunk_count * 125
-                        last_len     = len(self._last_interim_text)
-                        final_len    = len(self._final_transcript)
-                        truncated    = "TRUNCATED" if final_len < last_len else "ok"
-                        print(
-                            f"[STT] Turn summary: audio={audio_ms}ms, "
-                            f"vad_begin={self._vad_begin_count}, vad_end={self._vad_end_count}, "
-                            f"last_interim_len={last_len}, final_len={final_len} ({truncated})"
-                        )
-                        self._stop = True
-                        self._transcript_ready.set()
-                        self._result_event.set()
-                        return
-                    elif transcript.strip():
-                        text_stripped = transcript.strip()
-                        # 매 unique interim 마다 로그 — 첫 turn 잘림 진단용.
-                        # 직전 interim 과 동일하면 skip (중복 억제).
-                        if text_stripped != self._last_interim_text:
-                            tag = "1st" if not self._has_interim_content else "..."
-                            print(f"[STT] Interim ({tag}): '{text_stripped[:60]}'")
-                            self._last_interim_text = text_stripped
-                        if not self._has_interim_content:
-                            # 첫 번째 interim 결과로 speech_started 보장
-                            # (client VAD가 감지하지 못한 경우 fallback)
-                            if not self.speech_started:
-                                self.speech_started = True
-                                self.speech_started_time = time.time()
-                        self._has_interim_content = True
+            if joined:
+                self._final_transcript = joined
+                audio_ms  = self._yielded_chunk_count * 125
+                last_len  = len(self._last_interim_text)
+                final_len = len(self._final_transcript)
+                truncated = "TRUNCATED" if final_len < last_len else "ok"
+                print(
+                    f"[STT] Combined ({iter_count} streams, {len(transcripts)} finals): "
+                    f"'{self._final_transcript}'"
+                )
+                print(
+                    f"[STT] Turn summary: audio={audio_ms}ms, "
+                    f"vad_begin={self._vad_begin_count}, vad_end={self._vad_end_count}, "
+                    f"streams={iter_count}, finals={len(transcripts)}, "
+                    f"final_len={final_len} ({truncated})"
+                )
+            else:
+                if not self._final_transcript:
+                    self._final_transcript = "non_voice"
+                print(f"[STT] No content recognized → '{self._final_transcript}'")
 
-                # ② VAD 이벤트 처리 — results 이후에 평가
-                if self.use_server_vad and response.speech_event_type:
-                    self._handle_vad_event(response.speech_event_type)
-
-            # 스트림 정상 종료: responses 소진 후 final result가 없으면 non_voice 처리
-            # (음성이 너무 짧아서 Google STT가 인식 불가한 경우)
-            if not self._result_event.is_set():
-                print("[STT] Stream ended without final result → non_voice")
-                self._final_transcript = "non_voice"
-                self._transcript_ready.set()
-                self._result_event.set()
+            self._transcript_ready.set()
+            self._result_event.set()
 
         except Exception as e:
             print(f"[STT] Error: {e}")
             self._stt_error = str(e)
             self._result_event.set()
+
+    @staticmethod
+    def _dedupe_join(parts: list) -> str:
+        """
+        chirp_3 multi-stream finals 을 합치되, prefix 중복 제거.
+        예: ['파견 보안관제 원격', '의 차이는 무엇인가요'] → '파견 보안관제 원격 의 차이는 무엇인가요'
+        예: ['중소기업도 인증이', '중소기업도 인증이 꼭 필요한가요'] → '중소기업도 인증이 꼭 필요한가요'
+        예: ['제로트러스트 보안이란', '무엇인가요'] → '제로트러스트 보안이란 무엇인가요'
+        """
+        if not parts:
+            return ""
+        out = parts[0].strip()
+        for p in parts[1:]:
+            p = p.strip()
+            if not p:
+                continue
+            # p 가 out 의 끝 부분과 겹치면 (chirp_3 가 같은 구절을 반복하는 경우)
+            # 또는 out 이 p 의 prefix 면 (다음 stream 이 더 긴 결과 출력) → 더 긴 것으로 교체.
+            if out.startswith(p) or p in out:
+                continue  # already covered
+            if p.startswith(out):
+                out = p
+                continue
+            # overlap 검사: out 의 suffix 와 p 의 prefix 중복 부분 트림
+            max_overlap = min(len(out), len(p), 30)
+            trim = 0
+            for k in range(max_overlap, 0, -1):
+                if out.endswith(p[:k]):
+                    trim = k
+                    break
+            out = out + " " + (p[trim:] if trim else p)
+        return out
 
     def _audio_generator(self):
         """
@@ -358,6 +452,11 @@ class GoogleSTTV2:
 
         for chunk in self._audio_source:
             if self._stop:
+                break
+
+            # multi-stream restart — outer 루프가 새 stream 시작 하도록 generator break.
+            # gRPC clean EOF → for response 루프 종료 → outer while 다음 iteration.
+            if self._inner_stream_should_end:
                 break
 
             # EOS 커밋 후 종료 (flush 5청크 완료 후에만 _process_audio=False가 됨)
