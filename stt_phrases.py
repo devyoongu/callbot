@@ -102,7 +102,7 @@ def build_adaptation():
 
 
 # 모델별 adaptation 지원 여부 — stt.py 가 분기 시 사용
-ADAPTATION_SUPPORTED_MODELS = {"chirp_3"}
+ADAPTATION_SUPPORTED_MODELS = {"chirp_3", "chirp_2"}
 
 
 def supports_adaptation(model: str) -> bool:

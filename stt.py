@@ -48,6 +48,13 @@ class GoogleSTTV2:
             "endpoint": "us-speech.googleapis.com",
             "sample_rate": 16000,
         },
+        "chirp_2": {
+            # us-central1 리전에서 adaptation+boost 지원. chirp_3 와 finalization
+            # 동작이 다를 수 있어 뒤쪽 잘림 회귀에 대안으로 시험.
+            "region": "us-central1",
+            "endpoint": "us-central1-speech.googleapis.com",
+            "sample_rate": 16000,
+        },
         "telephony": {
             "region": "global",
             "endpoint": "speech.googleapis.com",
