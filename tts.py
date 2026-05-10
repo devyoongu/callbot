@@ -335,3 +335,121 @@ def synthesize_pcm_8bit_unsigned(text: str) -> bytes:
     pcm_8bit  = audioop.lin2lin(pcm_16bit, 2, 1)   # 16-bit → 8-bit signed
     pcm_8bit  = audioop.bias(pcm_8bit, 1, 128)     # signed → unsigned
     return pcm_8bit
+
+
+# pyVoIP writeAudio 입력 단위 — 8kHz 8-bit unsigned 기준 160 bytes = 20ms.
+_STREAM_OUT_CHUNK = 160
+
+
+def synthesize_pcm_8bit_unsigned_streaming(text: str) -> Iterator[bytes]:
+    """
+    Streaming 합성 — 8kHz 8-bit unsigned PCM 을 _STREAM_OUT_CHUNK(=160 bytes, 20ms)
+    단위로 yield. 첫 chunk 도달까지의 시간(TTFA)이 전체 합성 시간보다 훨씬 짧다.
+
+    Cache hit: 캐시된 16-bit 8kHz PCM 을 8-bit unsigned 로 변환 후 chunk yield.
+               (~0ms TTFA — 디스크 read 비용 정도)
+
+    Cache miss: GoogleTTS.synthesize_streaming() 으로 24kHz chunk 받아
+                stateful audioop.ratecv 로 24k→8k downsample, 8-bit unsigned 변환,
+                trim_start(첫 20ms 제거)/fade_out(끝 50ms 페이드)/padding(끝 200ms 무음)
+                을 streaming 방식으로 적용. 정상 종료 시 누적 PCM 을 16-bit WAV 로 캐시.
+
+    회귀 위험: tail_buf 에 보관된 마지막 50ms 가 fade 적용 전에 yield 되지 않게
+    주의 — 본 구현은 매 입력 chunk 후 (현재 buffer - TAIL_KEEP) 만큼만 처리.
+    예외 발생 시 부분 PCM 캐시는 작성하지 않음.
+    """
+    tts        = _get_tts()
+    cache_path = _CACHE_DIR / f"{_cache_key(text, tts.voice_name)}.wav"
+
+    cached = _load_cached_pcm_8k(cache_path)
+    if cached is not None:
+        print(f"[TTS] Cache hit (stream): {cache_path.name} ({len(cached)} bytes) — {text[:30]!r}")
+        pcm_8bit = audioop.lin2lin(cached, 2, 1)
+        pcm_8bit = audioop.bias(pcm_8bit, 1, 128)
+        for i in range(0, len(pcm_8bit), _STREAM_OUT_CHUNK):
+            chunk = pcm_8bit[i:i + _STREAM_OUT_CHUNK]
+            if len(chunk) < _STREAM_OUT_CHUNK:
+                chunk = chunk + b"\x80" * (_STREAM_OUT_CHUNK - len(chunk))
+            yield chunk
+        return
+
+    # Cache miss — Google TTS streaming
+    TRIM_HEAD = SAMPLE_RATE * 2 * TRIM_START_MS // 1000   # 24kHz 16-bit, 20ms = 960 bytes
+    TAIL_KEEP = SAMPLE_RATE * 2 * FADE_OUT_MS // 1000     # 24kHz 16-bit, 50ms = 2400 bytes
+    PAD_OUT   = 8000 * PADDING_MS // 1000                 # 8kHz 8-bit, 200ms = 1600 bytes
+    PAD_16BIT = PAD_OUT * 2                               # 8kHz 16-bit silence (cache 누적용)
+
+    ratecv_state = None
+    is_first     = True
+    got_audio    = False
+    tail_buf     = bytearray()
+    out_buf      = bytearray()
+    accum_8k     = bytearray()
+
+    def _convert_24k_to_8bit(pcm_24k: bytes):
+        """24kHz 16-bit chunk → 8kHz 16-bit (cache용 누적) + 8kHz 8-bit unsigned (out_buf)."""
+        nonlocal ratecv_state
+        pcm_8k_16, ratecv_state = audioop.ratecv(
+            pcm_24k, 2, 1, SAMPLE_RATE, 8000, ratecv_state
+        )
+        accum_8k.extend(pcm_8k_16)
+        pcm_8k_8 = audioop.lin2lin(pcm_8k_16, 2, 1)
+        pcm_8k_8 = audioop.bias(pcm_8k_8, 1, 128)
+        out_buf.extend(pcm_8k_8)
+
+    success = False
+    try:
+        for response_24k in tts.synthesize_streaming(text):
+            if not response_24k:
+                continue
+            if is_first:
+                is_first = False
+                if len(response_24k) <= TRIM_HEAD:
+                    continue
+                response_24k = response_24k[TRIM_HEAD:]
+            got_audio = True
+
+            tail_buf.extend(response_24k)
+            if len(tail_buf) > TAIL_KEEP:
+                excess     = len(tail_buf) - TAIL_KEEP
+                to_process = bytes(tail_buf[:excess])
+                del tail_buf[:excess]
+                _convert_24k_to_8bit(to_process)
+
+            while len(out_buf) >= _STREAM_OUT_CHUNK:
+                chunk = bytes(out_buf[:_STREAM_OUT_CHUNK])
+                del out_buf[:_STREAM_OUT_CHUNK]
+                yield chunk
+
+        if not got_audio:
+            return  # 빈 응답 — silence padding 도 캐시 작성도 skip
+
+        # Stream 정상 종료 — tail (마지막 50ms) 에 fade-out 적용 후 처리
+        if tail_buf:
+            faded = _apply_fade_out(bytes(tail_buf), FADE_OUT_MS, SAMPLE_RATE)
+            tail_buf.clear()
+            _convert_24k_to_8bit(faded)
+
+        # 200ms silence padding (8-bit unsigned 의 무음 = 0x80, 16-bit 의 무음 = 0x00)
+        out_buf.extend(b"\x80" * PAD_OUT)
+        accum_8k.extend(b"\x00" * PAD_16BIT)
+
+        while len(out_buf) >= _STREAM_OUT_CHUNK:
+            chunk = bytes(out_buf[:_STREAM_OUT_CHUNK])
+            del out_buf[:_STREAM_OUT_CHUNK]
+            yield chunk
+        if out_buf:
+            chunk = bytes(out_buf) + b"\x80" * (_STREAM_OUT_CHUNK - len(out_buf))
+            out_buf.clear()
+            yield chunk
+
+        success = True
+    finally:
+        # 정상 종료한 경우에만 캐시 작성. 부분 합성 PCM 이 캐시되면 이후 호출이
+        # 잘린 음성으로 재생되는 회귀가 발생함.
+        if success and accum_8k:
+            try:
+                _save_pcm_8k_as_wav(bytes(accum_8k), cache_path)
+                print(f"[TTS] Cached (stream): {cache_path.name} ({len(accum_8k)} bytes) — {text[:30]!r}")
+            except Exception as e:
+                print(f"[TTS] Cache save failed: {e}")

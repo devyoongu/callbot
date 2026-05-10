@@ -21,7 +21,7 @@ from typing import Optional, Tuple
 import config as cfg
 from audio_source import CallAudioSource
 from stt import GoogleSTTV2, create_stt
-from tts import synthesize_pcm_8bit_unsigned
+from tts import synthesize_pcm_8bit_unsigned_streaming
 from athena import AthenaClient
 
 logger = logging.getLogger("callbot")
@@ -49,49 +49,30 @@ def _send_priming_silence(call, num_chunks: int = 25):
         time.sleep(_SLEEP_SEC)
 
 
-def _send_pcm_8bit(call, pcm_8bit: bytes, label: str,
-                   stop_event: Optional[threading.Event] = None) -> int:
-    """
-    8-bit unsigned PCM 청크를 pyVoIP writeAudio() 로 실시간 송출.
-    매 청크마다 call.state 와 stop_event 확인 → 즉시 중단 가능.
-    Returns: 송출한 chunk 개수.
-    """
-    from pyVoIP.VoIP import CallState
-    sent = 0
-    for i in range(0, len(pcm_8bit), _CHUNK_SIZE):
-        if stop_event is not None and stop_event.is_set():
-            break
-        if call.state != CallState.ANSWERED:
-            break
-
-        chunk = pcm_8bit[i:i + _CHUNK_SIZE]
-        if len(chunk) < _CHUNK_SIZE:
-            chunk = chunk + b"\x80" * (_CHUNK_SIZE - len(chunk))
-
-        try:
-            call.writeAudio(chunk)
-            sent += 1
-        except Exception as e:
-            logger.warning(f"[TTS] writeAudio error ({label[:30]!r}): {e}")
-            break
-
-        time.sleep(_SLEEP_SEC)
-    return sent
-
-
 class TTSPipeline:
     """
-    한 통화 동안 TTS 합성과 재생을 파이프라이닝.
+    한 통화 동안 TTS 합성과 재생을 파이프라이닝 (streaming 모드).
 
-    - enqueue(text):  non-blocking. ThreadPoolExecutor에 합성 submit, FIFO 큐에 적재.
-    - 백그라운드 play_thread: 큐에서 (text, future) pop → future.result() blocking → 재생.
-    - call.state != ANSWERED 또는 stop_event 감지 시 즉시 종료.
-    - wait_drained(): 큐 비고 재생 완료 대기 (turn 경계에서 호출 → STT 시작 전 echo 방지).
-    - clear_pending(): 큐에 쌓인 미재생 항목 drop (Athena 예외 → fallback 재생 직전).
-    - shutdown(): poison pill + executor shutdown + thread join.
+    - enqueue(text): non-blocking. sentence 별 chunk_q 생성, ThreadPoolExecutor 에
+                     synth_worker 제출, outer FIFO 에 (text, chunk_q) 적재.
+    - synth_worker:  synthesize_pcm_8bit_unsigned_streaming() generator drain →
+                     chunk_q 에 push. 첫 chunk 도달 시 TTFA 로깅 (UI 표시용).
+                     종료 시 None sentinel.
+    - play_thread:   outer FIFO 에서 (text, chunk_q) pop → PREBUFFER_CHUNKS 만큼
+                     prebuffer (jitter buffer) → chunk 단위 writeAudio + cadence sleep.
+                     stop_event / call.state != ANSWERED 시 즉시 중단.
+    - wait_drained(): 큐 비고 재생 완료 대기 (turn 경계에서 echo 방지용).
+    - clear_pending(): outer FIFO 의 미재생 항목 drop. 진행 중인 worker 는
+                       자연 종료 (chunk_q 가 더 이상 read 되지 않아도 generator 끝까지
+                       drain 후 None push 하고 종료).
+    - shutdown(): stop_event + poison + join + executor shutdown.
 
-    Lifecycle: call 단위 1회 생성/소멸. turn마다 재생성하지 않음.
+    Lifecycle: call 단위 1회 생성/소멸.
     """
+
+    PREBUFFER_CHUNKS    = 3      # 60ms jitter buffer (3 × 20ms)
+    PREBUFFER_TIMEOUT   = 5.0    # 첫 chunk 까지 최대 대기 시간 (s)
+    INTER_CHUNK_TIMEOUT = 5.0    # 재생 중 다음 chunk 까지 최대 대기 시간 (s)
 
     def __init__(self, call, call_id: str):
         self.call         = call
@@ -100,7 +81,8 @@ class TTSPipeline:
             max_workers=2,
             thread_name_prefix=f"tts-synth-{call_id[:8]}",
         )
-        self.queue: "queue.Queue" = queue.Queue()  # of (text, future) tuples or None (poison)
+        # outer FIFO of (text, chunk_q) tuples or None (poison)
+        self.queue: "queue.Queue" = queue.Queue()
         self.stop_event   = threading.Event()
         self._primed      = False
         self._idle_event  = threading.Event()
@@ -143,23 +125,39 @@ class TTSPipeline:
         with self._inflight_lock:
             self._inflight += 1
             self._idle_event.clear()
+        chunk_q  = queue.Queue()
         submit_t = time.time()
-        future = self.executor.submit(synthesize_pcm_8bit_unsigned, text)
+        self.executor.submit(self._synth_worker, text, chunk_q, submit_t, kind)
+        self.queue.put((text, chunk_q))
 
-        # 합성 완료 시각을 별도 라인으로 로깅 → server.py SSE 가 'tts_synth'
-        # 이벤트로 브라우저에 push, 해당 bubble 에 synth latency 표시.
-        # 캐시 적중 시 ~0ms, 신규 합성 시 수백 ms.
-        def _on_synth_done(fut, _text=text, _kind=kind):
-            if fut.cancelled() or fut.exception() is not None:
-                return
-            synth_ms = (time.time() - submit_t) * 1000
-            kind_str = f", kind={_kind}" if _kind else ""
-            logger.info(
-                f"[{self.call_id[:8]}] TTS synth done: {_text[:60]!r} "
-                f"(synth={synth_ms:.0f}ms{kind_str})"
-            )
-        future.add_done_callback(_on_synth_done)
-        self.queue.put((text, future))
+    def _synth_worker(self, text: str, chunk_q: "queue.Queue",
+                      submit_t: float, kind: Optional[str]):
+        """
+        Generator drain → chunk_q. 첫 chunk push 시점에 TTFA 로깅 — server.py
+        SSE 가 'TTS TTFA:' 라인을 'tts_ttfa' 이벤트로 브라우저에 push.
+
+        TTFA 정의: submit_t → 첫 8kHz 8-bit unsigned PCM chunk 가 chunk_q 에
+        push 된 시점. (Google API 첫 응답 + downsample/8-bit 변환 까지 포함.)
+        실제 사용자 귀에 닿을 수 있는 PCM 이 준비된 시점에 가장 가까움.
+        """
+        ttfa_logged = False
+        try:
+            for chunk in synthesize_pcm_8bit_unsigned_streaming(text):
+                if self.stop_event.is_set():
+                    break
+                if not ttfa_logged:
+                    ttfa_ms  = (time.time() - submit_t) * 1000
+                    kind_str = f", kind={kind}" if kind else ""
+                    logger.info(
+                        f"[{self.call_id[:8]}] TTS TTFA: {text[:60]!r} "
+                        f"(ttfa={ttfa_ms:.0f}ms{kind_str})"
+                    )
+                    ttfa_logged = True
+                chunk_q.put(chunk)
+        except Exception as e:
+            logger.error(f"[{self.call_id[:8]}] TTS synth failed for {text[:40]!r}: {e}")
+        finally:
+            chunk_q.put(None)  # poison sentinel
 
     def wait_drained(self, timeout: float = 60.0) -> bool:
         """모든 enqueue 항목의 재생이 끝날 때까지 대기. timeout 시 False."""
@@ -167,8 +165,9 @@ class TTSPipeline:
 
     def clear_pending(self):
         """
-        큐에 쌓인 (아직 재생 시작 전) 항목들을 drop.
-        진행 중인 재생은 stop_event 로 별도 중단. 보통은 통화 종료 직전 사용.
+        outer FIFO 에 쌓인 (아직 재생 시작 전) 항목들을 drop.
+        진행 중인 worker 는 chunk_q 가 더 이상 소비되지 않아도 generator 끝까지
+        drain 후 자연 종료 — 메모리 leak 위험은 sentence 1개 분 (수백 KB) 으로 한정.
         """
         dropped = 0
         while True:
@@ -177,7 +176,6 @@ class TTSPipeline:
             except queue.Empty:
                 break
             if item is None:
-                # poison 다시 넣지 말고 drop — shutdown 에서 다시 put
                 continue
             dropped += 1
             with self._inflight_lock:
@@ -188,17 +186,26 @@ class TTSPipeline:
             logger.info(f"[{self.call_id[:8]}] TTS pipeline cleared {dropped} pending items")
 
     def shutdown(self, timeout: float = 5.0):
-        """클린 종료 — 큐 잔여 drop, play_thread join, executor shutdown."""
+        """클린 종료 — stop_event 설정, poison, play_thread join, executor shutdown."""
         self.stop_event.set()
-        self.queue.put(None)  # poison
+        self.queue.put(None)
         self.play_thread.join(timeout=timeout)
         if self.play_thread.is_alive():
             logger.warning(f"[{self.call_id[:8]}] TTS play_thread did not exit within {timeout}s")
         try:
             self.executor.shutdown(wait=False, cancel_futures=True)
         except TypeError:
-            # cancel_futures 는 Python 3.9+
             self.executor.shutdown(wait=False)
+
+    def _drain_chunk_q(self, chunk_q: "queue.Queue"):
+        """chunk_q 에서 None sentinel 까지 모든 chunk 폐기. worker 종료 보장용."""
+        while True:
+            try:
+                x = chunk_q.get(timeout=0.1)
+            except queue.Empty:
+                return
+            if x is None:
+                return
 
     def _play_loop(self):
         from pyVoIP.VoIP import CallState
@@ -209,30 +216,84 @@ class TTSPipeline:
                 continue
             if item is None:
                 break
-            text, future = item
+            text, chunk_q = item
             try:
                 if self.call.state != CallState.ANSWERED:
                     logger.info(
                         f"[{self.call_id[:8]}] TTS skip (call not answered): {text[:40]!r}"
                     )
+                    self._drain_chunk_q(chunk_q)
                     continue
-                try:
-                    pcm_8bit = future.result(timeout=15.0)
-                except Exception as e:
-                    logger.error(
-                        f"[{self.call_id[:8]}] TTS synth failed for {text[:40]!r}: {e}"
-                    )
-                    continue
+
                 if not self._primed:
                     _send_priming_silence(self.call)
                     self._primed = True
                     logger.info(f"[{self.call_id[:8]}] TTS RTP primed (one-shot per call)")
+
+                # Prebuffer (jitter buffer) — Google streaming inter-chunk gap 흡수.
+                prebuf      = []
+                stream_done = False
+                for _ in range(self.PREBUFFER_CHUNKS):
+                    try:
+                        c = chunk_q.get(timeout=self.PREBUFFER_TIMEOUT)
+                    except queue.Empty:
+                        logger.warning(
+                            f"[{self.call_id[:8]}] TTS prebuffer timeout: {text[:40]!r}"
+                        )
+                        break
+                    if c is None:
+                        stream_done = True
+                        break
+                    prebuf.append(c)
+
+                if not prebuf:
+                    logger.warning(f"[{self.call_id[:8]}] TTS no audio: {text[:40]!r}")
+                    continue
+
                 logger.info(
                     f"[{self.call_id[:8]}] TTS play start "
-                    f"({len(pcm_8bit)} bytes, {len(pcm_8bit)//_CHUNK_SIZE} chunks): "
-                    f"{text[:60]!r}"
+                    f"(prebuf={len(prebuf)} chunks): {text[:60]!r}"
                 )
-                sent = _send_pcm_8bit(self.call, pcm_8bit, text, self.stop_event)
+                sent = 0
+                for chunk in prebuf:
+                    if self.stop_event.is_set() or self.call.state != CallState.ANSWERED:
+                        break
+                    try:
+                        self.call.writeAudio(chunk)
+                        sent += 1
+                    except Exception as e:
+                        logger.warning(f"[TTS] writeAudio error ({text[:30]!r}): {e}")
+                        stream_done = True
+                        break
+                    time.sleep(_SLEEP_SEC)
+
+                while not stream_done:
+                    if self.stop_event.is_set() or self.call.state != CallState.ANSWERED:
+                        break
+                    try:
+                        c = chunk_q.get(timeout=self.INTER_CHUNK_TIMEOUT)
+                    except queue.Empty:
+                        logger.warning(
+                            f"[{self.call_id[:8]}] TTS chunk timeout mid-stream: "
+                            f"{text[:40]!r}"
+                        )
+                        break
+                    if c is None:
+                        stream_done = True
+                        break
+                    try:
+                        self.call.writeAudio(c)
+                        sent += 1
+                    except Exception as e:
+                        logger.warning(f"[TTS] writeAudio error ({text[:30]!r}): {e}")
+                        break
+                    time.sleep(_SLEEP_SEC)
+
+                # 중단된 경우: worker 가 None sentinel push 까지 끝까지 drain 하도록
+                # 잔여 chunk 를 폐기해 worker thread leak 방지.
+                if not stream_done:
+                    self._drain_chunk_q(chunk_q)
+
                 logger.info(
                     f"[{self.call_id[:8]}] TTS play done ({sent} chunks): {text[:40]!r}"
                 )
