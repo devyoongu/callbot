@@ -295,7 +295,7 @@ def _save_pcm_8k_as_wav(pcm: bytes, cache_path: Path):
     tmp.replace(cache_path)
 
 
-def synthesize_pcm_8k(text: str) -> bytes:
+def synthesize_pcm_8k(text: str, tts: Optional[GoogleTTS] = None) -> bytes:
     """
     텍스트 → 8kHz 16-bit mono PCM
 
@@ -304,8 +304,12 @@ def synthesize_pcm_8k(text: str) -> bytes:
 
     캐시: wav/_cache/{hash16}.wav 에 저장. text+voice 해시가 같으면
     GCP TTS를 호출하지 않고 디스크에서 즉시 로드.
+
+    `tts` 가 주어지면 해당 인스턴스로 합성 (e.g. web-rtc 가 봇과 다른 voice 를
+    쓰고 싶을 때). 기본은 process-level 싱글톤.
     """
-    tts        = _get_tts()
+    if tts is None:
+        tts = _get_tts()
     cache_path = _CACHE_DIR / f"{_cache_key(text, tts.voice_name)}.wav"
 
     cached = _load_cached_pcm_8k(cache_path)
