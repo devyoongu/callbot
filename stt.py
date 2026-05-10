@@ -314,8 +314,8 @@ class GoogleSTTV2:
         """
         EXPECTED_CHUNK_BYTES = int(self.sample_rate * 0.125 * 2)  # 125ms — 2000@8k / 4000@16k
         RMS_THRESHOLD        = 200
-        SILENCE_THRESHOLD    = 5     # 5 × 125ms = 625ms
-        EOS_TRAIL_CHUNKS     = 4     # 500ms — EOS 후 trailing audio 추가 버퍼
+        SILENCE_THRESHOLD    = 4     # 4 × 125ms = 500ms
+        EOS_TRAIL_CHUNKS     = 2     # 250ms — EOS 후 trailing audio 추가 버퍼
 
         # webrtcvad 의 setuptools 82+ 호환 이슈 (pkg_resources 제거) 로 의존
         # 제거. RMS-only 판정. callbot 환경 (TTS-as-mic + telephony codec) 에서
