@@ -464,16 +464,21 @@ class GoogleSTTV2:
             SpeechEventType.END_OF_SINGLE_UTTERANCE,
         ):
             self._vad_end_count += 1
+            # latency 측정용 — interim 유무와 무관하게 최신 END 시각 기록.
+            # chirp_3 는 interim 거의 emit 하지 않아 _has_interim_content 가 False
+            # 인 상태로 END 가 도착함. 이 시각이 없으면 STT latency 메트릭이 n=0
+            # 으로 표시됨. 마지막 END 가 진짜 EOS 후보이므로 매번 갱신.
+            self.last_speech_end_time = time.time()
             if self._has_interim_content:
                 # 서버 VAD는 단어 사이 쉬는 구간(~300ms)에도 END를 발화하여 문장이 잘림.
                 # generator를 멈추지 않고 계속 오디오 전송 — client VAD가 EOS 담당.
                 # (log 증거: END 직후 두 번째 BEGIN이 오는 것 = 사용자가 계속 말하는 중)
-                # latency 측정용으로 최신 END 시각만 기록 (마지막 END 가 진짜 EOS 후보).
-                self.last_speech_end_time = time.time()
                 print(f"[STT] VAD: Speech END (#{self._vad_end_count}) — real speech, continuing (client VAD handles EOS)")
             else:
-                # interim 없음 = 에코/잡음 → speech_started 리셋 후 계속 청취
-                print(f"[STT] VAD: Speech END (#{self._vad_end_count}) — no content (echo/noise), continuing")
+                # interim 없음 = telephony 에코/잡음 또는 chirp_3 의 정상 EOS.
+                # speech_started 만 리셋 (echo 방지) — last_speech_end_time 은 위에서
+                # 이미 기록됐으므로 latency 측정에 영향 없음.
+                print(f"[STT] VAD: Speech END (#{self._vad_end_count}) — no interim (chirp_3 silent-final or echo), continuing")
                 self.speech_started      = False
                 self.speech_started_time = None
 
