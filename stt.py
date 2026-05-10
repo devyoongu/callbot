@@ -97,6 +97,12 @@ class GoogleSTTV2:
         # 폴링 루프에서 바쁜 대기(busy-wait) 없이 final result를 기다리기 위한 이벤트
         self._transcript_ready        = threading.Event()
 
+        # 진단용 — turn 별로 reset (start_streaming 에서 0/""로)
+        self._last_interim_text       = ""
+        self._yielded_chunk_count     = 0
+        self._vad_begin_count         = 0
+        self._vad_end_count           = 0
+
     # ── 공개 API ──────────────────────────────────────────────────────
 
     def initialize(self):
@@ -132,6 +138,10 @@ class GoogleSTTV2:
         self._speech_started_consumed = False
         self._eos_consumed            = False
         self._transcript_ready.clear()
+        self._last_interim_text       = ""
+        self._yielded_chunk_count     = 0
+        self._vad_begin_count         = 0
+        self._vad_end_count           = 0
 
         self._audio_source = audio_source
         self._streaming_thread = threading.Thread(
@@ -261,13 +271,31 @@ class GoogleSTTV2:
                             src = "clientEOS" if self.eos_time else "serverEND"
                             latency_str = f" ({src}→Final {latency_ms:.0f}ms)"
                         print(f"[STT] Final: '{self._final_transcript}'{latency_str}")
+                        # turn 진단 summary — 첫 turn 잘림 분석용 한 줄.
+                        # VAD BEGIN/END count = 사용자가 발화 중 멈춘 횟수의 근사.
+                        # last_interim 보다 final 이 짧으면 STT 가 뒤를 쳐낸 것.
+                        audio_ms     = self._yielded_chunk_count * 125
+                        last_len     = len(self._last_interim_text)
+                        final_len    = len(self._final_transcript)
+                        truncated    = "TRUNCATED" if final_len < last_len else "ok"
+                        print(
+                            f"[STT] Turn summary: audio={audio_ms}ms, "
+                            f"vad_begin={self._vad_begin_count}, vad_end={self._vad_end_count}, "
+                            f"last_interim_len={last_len}, final_len={final_len} ({truncated})"
+                        )
                         self._stop = True
                         self._transcript_ready.set()
                         self._result_event.set()
                         return
                     elif transcript.strip():
+                        text_stripped = transcript.strip()
+                        # 매 unique interim 마다 로그 — 첫 turn 잘림 진단용.
+                        # 직전 interim 과 동일하면 skip (중복 억제).
+                        if text_stripped != self._last_interim_text:
+                            tag = "1st" if not self._has_interim_content else "..."
+                            print(f"[STT] Interim ({tag}): '{text_stripped[:60]}'")
+                            self._last_interim_text = text_stripped
                         if not self._has_interim_content:
-                            print(f"[STT] Interim: '{transcript.strip()[:30]}'")
                             # 첫 번째 interim 결과로 speech_started 보장
                             # (client VAD가 감지하지 못한 경우 fallback)
                             if not self.speech_started:
@@ -338,6 +366,7 @@ class GoogleSTTV2:
             if flush_remaining > 0:
                 flush_remaining -= 1
                 yield cloud_speech_types.StreamingRecognizeRequest(audio=chunk)
+                self._yielded_chunk_count += 1
                 if flush_remaining == 0:
                     print(f"[STT] Client VAD: EOS flush done — committing")
                     self.eos_done       = True
@@ -369,7 +398,16 @@ class GoogleSTTV2:
                                 # 625ms 무음 + interim 존재 → flush 단계 진입.
                                 # 즉시 break하지 않고 5청크(~625ms)를 더 흘려서
                                 # Google이 is_final을 emit할 시간을 확보한다.
-                                print(f"[STT] Client VAD: EOS triggered (625ms silence) — flushing {EOS_FLUSH_CHUNKS} more chunks")
+                                # 진단: yielded_chunk_count = 지금까지 STT 로 흘려보낸 청크 수
+                                # (×125ms = 이번 turn 의 audio duration). last_interim 은 이 시점의
+                                # 가장 긴 interim — final 이 이거보다 짧으면 STT 가 잘린 것.
+                                audio_ms = self._yielded_chunk_count * 125
+                                print(
+                                    f"[STT] Client VAD: EOS triggered ({silence_frames}×125ms="
+                                    f"{silence_frames*125}ms silence, audio={audio_ms}ms, "
+                                    f"last_interim='{self._last_interim_text[:40]}') — "
+                                    f"flushing {EOS_FLUSH_CHUNKS} more chunks"
+                                )
                                 flush_remaining = EOS_FLUSH_CHUNKS
                             else:
                                 # interim 없음 = echo/noise → 리셋 후 계속 청취
@@ -383,6 +421,7 @@ class GoogleSTTV2:
             # ────────────────────────────────────────────────────────────────────
 
             yield cloud_speech_types.StreamingRecognizeRequest(audio=chunk)
+            self._yielded_chunk_count += 1
 
     def _client_vad_check(self, vad, chunk: bytes, frame_size: int, rms_threshold: float) -> bool:
         """WebRTC VAD + RMS 에너지 이중 판단"""
@@ -403,7 +442,8 @@ class GoogleSTTV2:
         SpeechEventType = cloud_speech_types.StreamingRecognizeResponse.SpeechEventType
 
         if event_type == SpeechEventType.SPEECH_ACTIVITY_BEGIN:
-            print("[STT] VAD: Speech BEGIN")
+            self._vad_begin_count += 1
+            print(f"[STT] VAD: Speech BEGIN (#{self._vad_begin_count})")
             self.speech_started      = True
             self.speech_started_time = time.time()
             # _has_interim_content 리셋 안 함:
@@ -415,16 +455,17 @@ class GoogleSTTV2:
             SpeechEventType.SPEECH_ACTIVITY_END,
             SpeechEventType.END_OF_SINGLE_UTTERANCE,
         ):
+            self._vad_end_count += 1
             if self._has_interim_content:
                 # 서버 VAD는 단어 사이 쉬는 구간(~300ms)에도 END를 발화하여 문장이 잘림.
                 # generator를 멈추지 않고 계속 오디오 전송 — client VAD가 EOS 담당.
                 # (log 증거: END 직후 두 번째 BEGIN이 오는 것 = 사용자가 계속 말하는 중)
                 # latency 측정용으로 최신 END 시각만 기록 (마지막 END 가 진짜 EOS 후보).
                 self.last_speech_end_time = time.time()
-                print("[STT] VAD: Speech END — real speech, continuing (client VAD handles EOS)")
+                print(f"[STT] VAD: Speech END (#{self._vad_end_count}) — real speech, continuing (client VAD handles EOS)")
             else:
                 # interim 없음 = 에코/잡음 → speech_started 리셋 후 계속 청취
-                print("[STT] VAD: Speech END — no content (echo/noise), continuing")
+                print(f"[STT] VAD: Speech END (#{self._vad_end_count}) — no content (echo/noise), continuing")
                 self.speech_started      = False
                 self.speech_started_time = None
 
