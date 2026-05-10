@@ -135,9 +135,11 @@ per-turn:
 
 ### Trade-off
 
-- **STT latency: 570ms → 2.42s** (+1.85s/turn)
-  - 내역: sync API call 2.2-2.7s + VAD silence detection 625ms
-  - user 가 발화 끝낸 후 봇 응답까지 +1.85s 지연
+- **STT latency: 570ms → 2.42s** (+1.85s/turn) — 이후 commit 2bec88e 의
+  VAD 튜닝 (`SILENCE_THRESHOLD` 5→4, `EOS_TRAIL_CHUNKS` 4→2) 으로 -375ms
+  회복, 단위 테스트 elapsed 9063→8688ms (인식률 93.4% 그대로 유지).
+  - 잔여 floor: sync API call 2.0-2.7s (us 리전, 줄일 수 없음) + VAD
+    silence 500ms + trail buffer 250ms.
 - **인식률 +17-25pp**, 트레일링 잘림 0/15
 - 사용자 우선순위 (트레일링 잘림이 critical) 에 부합
 

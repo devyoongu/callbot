@@ -9,19 +9,20 @@
 
 ### 1. STT latency 단축 (2.42s → 1.0s 목표)
 
-**현황**: sync `recognize()` 전환으로 정확도 +17~25pp 얻었지만, turn 당 +1.85s
-지연. 내역:
-- VAD silence detection: 625ms (`SILENCE_THRESHOLD=5` × 125ms)
-- sync API call (us 리전): 2.0–2.7s (audio 5–10s 기준)
+**진행**: VAD 상수 튜닝으로 -375ms 단축 (commit 2bec88e, 2026-05-11).
+- `SILENCE_THRESHOLD` 5→4 (-125ms), `EOS_TRAIL_CHUNKS` 4→2 (-250ms)
+- 단위 테스트 (n=15): accuracy 93.4% 유지, elapsed 9063→8688ms, truncated 0/15
+- `SILENCE_THRESHOLD=3` 시도는 q3 인식률 -11.9pp 회귀로 후퇴
 
-**아이디어**:
+**잔여**: 약 2.0s — 주된 floor 는 sync API call (us 리전, 2.0–2.7s).
+
+**남은 아이디어**:
 - (a) **TTS pre-roll 병렬화** — silence detection 확정 시점에 봇의 안내멘트
   ("잠시만 기다려 주세요", "확인하고 답변드리겠습니다") TTS 합성/재생을 미리
   시작. user 가 들을 때는 latency 가 숨겨짐. Athena 호출 전에 재생되므로
-  `sync recognize 결과 → Athena 질의` 와 직렬 의존도 없음.
-- (b) **silence threshold 단축** — 5 (625ms) → 4 (500ms). 짧은 발화의 마지막
-  음절이 silence 로 오인식될 위험 trade-off, 단위 테스트로 검증.
-- (c) **chirp_3 의 `streaming` 회귀 시도** (Google 측 개선 후) — 이번 fix
+  `sync recognize 결과 → Athena 질의` 와 직렬 의존도 없음. 매 turn 반복 시
+  부자연스러움 검증 필요 (긴 query 한정 또는 randomized variation).
+- (b) **chirp_3 의 `streaming` 회귀 시도** (Google 측 개선 후) — 이번 fix
   문서 (stt-trailing-cutoff-fix-2026-05-11.md) 의 단위 테스트로 동일 wav 회귀
   가능.
 
