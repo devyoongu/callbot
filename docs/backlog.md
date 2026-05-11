@@ -21,9 +21,12 @@
   `cfg.PREROLL_MESSAGE="네, 잠시만요."` + audio_source echo masking. e2e 5턴
   회귀 없음. **실제 latency 는 변동 없음 — 사용자가 EOS 후 ~500ms 에 ack 를
   듣기 시작해 dead air 가 짧게 느껴지는 효과만**. 본질적 latency 단축은 아님.
-- (b) **chirp_3 의 `streaming` 회귀 시도** (Google 측 개선 후) — sync 의 +1.85s
-  latency 를 줄이려면 streaming 모드 회귀가 본질적 해결. 이번 fix 문서
-  (stt-trailing-cutoff-fix-2026-05-11.md) 의 단위 테스트로 회귀 가능.
+- (b) **chirp_3 의 `streaming` 회귀** — `GCP_STT_MODE=streaming` 옵션 추가됨
+  (default sync). 단일 stream + is_final 누적 시도 (2026-05-11) 시 단위 테스트
+  accuracy 75.6% / truncated 6/15 — sync 93.4% 대비 -17.8pp 회귀.
+  근본 원인: 첫 `is_final` 후 audio 더 보내도 chirp_3 가 새 `is_final` 을
+  추가 발행하지 않음 (turn 당 `is_final_count=1`). Google 측 모델 개선 (mid-utterance
+  EOS 제어) 또는 새 streaming 모델 출시 시 같은 단위 테스트로 즉시 재비교 가능.
 - (c) **asia 리전 recognizer** (Google 이 chirp_3 를 asia 출시 시) — sync API
   의 us 왕복 latency (~300-500ms) 단축 가능.
 

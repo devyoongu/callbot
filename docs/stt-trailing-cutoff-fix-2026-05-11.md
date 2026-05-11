@@ -40,6 +40,7 @@ STT:    "중소기업도"  (16자 → 5자, 70% 손실)
 | `long`, `short` 모델 | 더 심하게 잘림 |
 | Trailing silence 1.5s padding | 효과 없음 |
 | Multi-stream restart (첫 is_final 후 새 stream) | unit test +1.8pp / e2e -7pp 회귀 |
+| 단일 stream + is_final 누적 (2026-05-11) | unit 75.6% (변동 없음) / truncated 6/15 — 첫 is_final 후 audio 더 보내도 새 is_final 안 도착 |
 
 ### 핵심 발견 — sync 와 streaming 의 결정적 차이
 

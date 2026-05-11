@@ -212,7 +212,16 @@ class GoogleSTTV2:
 
     def _run_streaming(self):
         """
-        sync (non-streaming) Recognize 기반 인식.
+        cfg.GCP_STT_MODE 에 따라 sync 또는 streaming 모드로 분기. 외부 호출자
+        (start_streaming) 는 method 이름만 호출하면 됨.
+        """
+        if cfg.GCP_STT_MODE == "streaming":
+            return self._run_stream_accumulate()
+        return self._run_sync()
+
+    def _run_sync(self):
+        """
+        sync (non-streaming) Recognize 기반 인식 — default.
 
         chirp_3 의 streaming 모드는 발화 중간 짧은 휴지에도 is_final 을 발행해
         뒤쪽이 통째로 잘림. 같은 wav 라도:
@@ -223,13 +232,10 @@ class GoogleSTTV2:
         flow:
           1) audio_source 에서 청크 받아 buffer 누적 + client VAD 로 발화/silence
              감지 (기존 streaming 모드의 VAD 로직과 동일).
-          2) silence_frames >= SILENCE_THRESHOLD (625ms) 도달 시 EOS 커밋 +
+          2) silence_frames >= SILENCE_THRESHOLD (500ms) 도달 시 EOS 커밋 +
              버퍼링 종료.
           3) 버퍼 audio 를 sync recognize() 1회 호출.
           4) response.results[*].alternatives[0].transcript 들 join 해 final 로.
-
-        method 이름은 _run_streaming 그대로 — 외부 호출자 (start_streaming) 와
-        역할 동등 (백그라운드 thread 에서 인식 실행).
         """
         try:
             recognizer_path = (
@@ -302,6 +308,167 @@ class GoogleSTTV2:
 
         except Exception as e:
             print(f"[STT] Error: {e}")
+            self._stt_error = str(e)
+            self._result_event.set()
+
+    def _run_stream_accumulate(self):
+        """
+        streaming_recognize 사용 + is_final 누적 (회귀 시도).
+
+        chirp_3 가 mid-utterance is_final 을 발행해도 stream 을 끊지 않고 audio
+        를 계속 보내면서 들어오는 모든 is_final 텍스트를 누적해 join. ⤳ 발화
+        후반부가 별 utterance 로 인식되어 추가 is_final 로 도착하면 자연스럽게
+        합쳐짐. 첫 is_final 에서 끊던 기존 streaming 의 trailing-cutoff 회피.
+
+        latency 이점: 마지막 is_final 은 사용자 발화 직후 (~수백 ms) 에 도착하므로
+        sync 의 +1.85s VAD+API call 보다 빠르다 — 단, mid-utterance is_final 들이
+        실제로 audio 의 모든 segment 를 커버해야 join 결과가 정확.
+
+        flow:
+          1) request_iter() 가 첫 request 로 streaming_config 보내고,
+             이후 audio_source 청크를 StreamingRecognizeRequest(audio=...) 로 yield.
+          2) 동시에 client VAD (RMS) 로 silence 추적 → SILENCE_THRESHOLD 시 EOS
+             커밋 + iterator 종료 (stream close).
+          3) responses 루프에서 is_final transcript 들 누적. join 후 final 채택.
+        """
+        try:
+            recognizer_path = (
+                f"projects/{self.project_id}/locations/{self.region}/recognizers/_"
+            )
+            config_kwargs = dict(
+                explicit_decoding_config=cloud_speech_types.ExplicitDecodingConfig(
+                    encoding=cloud_speech_types.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
+                    sample_rate_hertz=self.sample_rate,
+                    audio_channel_count=1,
+                ),
+                language_codes=[self.language],
+                model=self.model,
+            )
+            if supports_adaptation(self.model):
+                config_kwargs["adaptation"] = build_adaptation()
+                print(f"[STT] adaptation enabled for model={self.model}")
+            recognition_config = cloud_speech_types.RecognitionConfig(**config_kwargs)
+
+            streaming_config = cloud_speech_types.StreamingRecognitionConfig(
+                config=recognition_config,
+                streaming_features=cloud_speech_types.StreamingRecognitionFeatures(
+                    interim_results=True,
+                    enable_voice_activity_events=False,
+                ),
+            )
+
+            def request_iter():
+                # 첫 request: recognizer + streaming_config
+                yield cloud_speech_types.StreamingRecognizeRequest(
+                    recognizer=recognizer_path,
+                    streaming_config=streaming_config,
+                )
+
+                # client VAD constants — sync 와 동일
+                EXPECTED_CHUNK_BYTES = int(self.sample_rate * 0.125 * 2)
+                RMS_THRESHOLD     = 200
+                SILENCE_THRESHOLD = 4   # 4 × 125ms = 500ms
+
+                speech_detected   = False
+                silence_frames    = 0
+                high_energy_count = 0
+
+                for chunk in self._audio_source:
+                    if self._stop:
+                        return
+                    if not chunk:
+                        continue
+                    self._yielded_chunk_count += 1
+                    yield cloud_speech_types.StreamingRecognizeRequest(audio=chunk)
+
+                    if len(chunk) != EXPECTED_CHUNK_BYTES:
+                        continue
+                    samples = np.frombuffer(chunk, dtype=np.int16)
+                    rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+                    is_speech = rms >= RMS_THRESHOLD
+
+                    if is_speech:
+                        high_energy_count += 1
+                        if high_energy_count >= 2 and not speech_detected:
+                            speech_detected = True
+                            silence_frames  = 0
+                            if not self.speech_started:
+                                self.speech_started      = True
+                                self.speech_started_time = time.time()
+                                print(f"[STT] Speech started (rms={rms:.0f})")
+                        if speech_detected:
+                            silence_frames = 0
+                    else:
+                        high_energy_count = 0
+                        if speech_detected:
+                            silence_frames += 1
+                            if silence_frames >= SILENCE_THRESHOLD:
+                                print(
+                                    f"[STT] EOS triggered (streaming, "
+                                    f"{silence_frames}×125ms={silence_frames*125}ms silence) — "
+                                    f"closing stream"
+                                )
+                                self.eos_done = True
+                                self.eos_time = time.time()
+                                return
+
+            responses = self.client.streaming_recognize(
+                requests=request_iter(),
+                timeout=30.0,
+            )
+
+            transcripts = []
+            last_interim = ""
+            for response in responses:
+                if self._stop:
+                    break
+                for result in response.results:
+                    if not result.alternatives:
+                        continue
+                    t = result.alternatives[0].transcript.strip()
+                    if result.is_final:
+                        if t:
+                            transcripts.append(t)
+                            print(f"[STT] is_final: '{t}'")
+                    elif t:
+                        last_interim = t
+
+            if not self.speech_started:
+                print(f"[STT] No speech detected → non_voice")
+                self._final_transcript = "non_voice"
+                self._transcript_ready.set()
+                self._result_event.set()
+                return
+
+            if transcripts:
+                self._final_transcript = " ".join(transcripts)
+            elif last_interim:
+                self._final_transcript = last_interim
+                print(f"[STT] No is_final — using last interim: '{last_interim}'")
+            else:
+                self._final_transcript = "non_voice"
+
+            self.final_time = time.time()
+            eos_t = self.eos_time or self.last_speech_end_time
+            latency_str = ""
+            if eos_t is not None:
+                latency_ms = (self.final_time - eos_t) * 1000
+                src = "clientEOS" if self.eos_time else "serverEND"
+                latency_str = f" ({src}→Final {latency_ms:.0f}ms)"
+            print(
+                f"[STT] Final (streaming, accumulated {len(transcripts)} is_final): "
+                f"'{self._final_transcript}'{latency_str}"
+            )
+            print(
+                f"[STT] Turn summary: yielded={self._yielded_chunk_count}, "
+                f"is_final_count={len(transcripts)}, final_len={len(self._final_transcript)}"
+            )
+
+            self._transcript_ready.set()
+            self._result_event.set()
+
+        except Exception as e:
+            print(f"[STT] Error (streaming): {e}")
             self._stt_error = str(e)
             self._result_event.set()
 

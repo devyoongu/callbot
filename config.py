@@ -24,6 +24,11 @@ GCP_PROJECT_ID   = os.getenv("GCP_PROJECT_ID", "gen-lang-client-0665942228")
 GCP_STT_MODEL    = os.getenv("GCP_STT_MODEL", "chirp_3")
 GCP_STT_LANGUAGE = os.getenv("GCP_STT_LANGUAGE", "ko-KR")
 GCP_TTS_VOICE    = os.getenv("GCP_TTS_VOICE", "chirp3-hd-achernar")
+# STT 인식 모드. "sync" 는 audio 전체를 한 번에 recognize (잘림 0, latency ~2.5s).
+# "streaming" 은 streaming_recognize 사용 + is_final 누적 (chirp_3 의 mid-utterance
+# is_final 을 끄지 못하므로 모두 누적해 join). latency 절감 시도용 — 회귀 시
+# 환경변수로 즉시 sync 복귀.
+GCP_STT_MODE     = os.getenv("GCP_STT_MODE", "sync")
 
 _cred_env = os.getenv("CREDENTIALS_DIR", "")
 CREDENTIALS_DIR = _cred_env if _cred_env else str(SCRIPT_DIR / "crendential")
