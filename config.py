@@ -46,11 +46,11 @@ MAX_NO_INPUT       = int(os.getenv("MAX_NO_INPUT", "3"))
 FALLBACK_GREETING  = os.getenv("FALLBACK_GREETING", "안녕하세요. 무엇을 도와드릴까요?")
 FALLBACK_NO_INPUT  = os.getenv("FALLBACK_NO_INPUT", "잘 들리지 않습니다. 다시 말씀해 주세요.")
 FALLBACK_GOODBYE   = os.getenv("FALLBACK_GOODBYE", "감사합니다. 안녕히 계세요.")
-# EOS 직후 즉시 enqueue 되는 pre-roll 멘트 — sync recognize ~2s + Athena 첫
-# 응답까지의 dead air 를 채워 사용자 체감 응답성 개선. turn 0 (greeting 직후)
-# 은 자연스러움 위해 skip. 빈 문자열로 두면 비활성. echo 회귀는 audio_source
-# 의 echo masking (_ECHO_MASK_SEC) 이 차단.
-PREROLL_MESSAGE    = os.getenv("PREROLL_MESSAGE", "네, 잠시만요.")
+# EOS 직후 즉시 enqueue 되는 pre-roll 멘트 (실험 옵션). Athena 의 meta_status
+# ("잠시만 기다려 주세요." 등) 와 중복되어 두 번 들리는 어색함이 있어 default
+# 비활성. 활성화 예: PREROLL_MESSAGE="네, 잠시만요."
+# Athena meta_status 를 client 측에서 대체하는 디자인을 적용할 때 다시 활성화.
+PREROLL_MESSAGE    = os.getenv("PREROLL_MESSAGE", "")
 
 
 def athena_configured() -> bool:

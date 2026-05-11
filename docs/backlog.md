@@ -17,10 +17,13 @@
 **잔여**: 약 2.0s — 주된 floor 는 sync API call (us 리전, 2.0–2.7s).
 
 **남은 아이디어**:
-- (a) **TTS pre-roll 으로 체감 dead air 가리기 — 적용됨** (2026-05-11).
-  `cfg.PREROLL_MESSAGE="네, 잠시만요."` + audio_source echo masking. e2e 5턴
-  회귀 없음. **실제 latency 는 변동 없음 — 사용자가 EOS 후 ~500ms 에 ack 를
-  듣기 시작해 dead air 가 짧게 느껴지는 효과만**. 본질적 latency 단축은 아님.
+- (a) **TTS pre-roll 으로 체감 dead air 가리기 — 인프라만 보존, default 비활성**
+  (2026-05-11). Athena 의 `meta_status` ("잠시만 기다려 주세요." 등) 와 멘트가
+  중복되어 "네, 잠시만요. 잠시만 기다려 주세요." 가 매 turn 반복되는 어색함
+  관찰 → `cfg.PREROLL_MESSAGE` default `""` (비활성). 인프라 (audio_source
+  echo masking + `_eos_preroll` 콜백) 는 유지. 진짜 활성화를 위해서는 callbot
+  측에서 Athena `meta_status` 를 client 멘트로 대체하는 디자인 (옵션 2) 가
+  먼저 필요.
 - (b) **chirp_3 의 `streaming` 회귀** — `GCP_STT_MODE=streaming` 옵션 추가됨
   (default sync). 단일 stream + is_final 누적 시도 (2026-05-11) 시 단위 테스트
   accuracy 75.6% / truncated 6/15 — sync 93.4% 대비 -17.8pp 회귀.
