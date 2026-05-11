@@ -153,6 +153,11 @@ class CallAudioSource:
                 if not started:
                     print(f"[AudioSource] First audio received ({len(raw)} bytes) after {total_reads} reads — STT streaming begins")
                     started = True
+                    # 첫 audio 도착 시점에 deadline 갱신 — 봇 응답 후 user TTS 가
+                    # 늦게 도착하는 케이스 (Turn 0 의 first audio after 10000+ reads)
+                    # 에서 발화가 deadline 으로 잘리지 않게 보장. silence 만 받는
+                    # idle 시간은 deadline 안 줄이고, 실제 발화부터 timeout_sec 카운트.
+                    deadline = time.time() + self._timeout_sec
 
             # 8-bit unsigned → 16-bit signed 변환 (pyVoIP parse_pcmu width=1 역변환)
             raw_signed = audioop.bias(raw, 1, -128)      # 0~255 → -128~127
