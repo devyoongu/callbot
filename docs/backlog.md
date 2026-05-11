@@ -17,15 +17,10 @@
 **잔여**: 약 2.0s — 주된 floor 는 sync API call (us 리전, 2.0–2.7s).
 
 **남은 아이디어**:
-- (a) **TTS pre-roll 병렬화** — silence detection 확정 시점에 봇의 안내멘트
-  TTS 합성/재생을 미리 시작. 인프라 추가됨 (`call_handler._eos_preroll` +
-  `cfg.PREROLL_MESSAGE`, default 비활성). 활성화 (`PREROLL_MESSAGE="네, 잠시만요."`)
-  e2e 검증 시 **직전 봇 응답의 RTP echo 가 다음 turn 의 STT 를 false-EOS 시켜
-  매 turn 추가 fallback** 회귀 관측. 디자인 보강 필요:
-    - echo 마스킹 (TTS playback 시각 + 200ms 까지 RTP 청크 silence 처리, P1 #4)
-    - 또는 pre-roll 을 STT Listening 시작 *후* 봇 응답 echo 가 잦아든 뒤 enqueue
-    - 또는 짧은 단발 ack 가 아닌 단/장 가변 pre-roll (이상적 길이 ≥ sync API
-      잔여시간)
+- (a) **TTS pre-roll 병렬화 — 적용됨** (2026-05-11). `cfg.PREROLL_MESSAGE`
+  기본값 `"네, 잠시만요."` + audio_source 의 echo masking 결합. e2e 5턴 검증
+  회귀 없음. 잔여 개선: 매 turn 동일 멘트 반복 자연스러움 검증 (긴 turn 한정
+  또는 randomized variation) — 사용자 청취 후 결정.
 - (b) **chirp_3 의 `streaming` 회귀 시도** (Google 측 개선 후) — 이번 fix
   문서 (stt-trailing-cutoff-fix-2026-05-11.md) 의 단위 테스트로 동일 wav 회귀
   가능.
@@ -64,16 +59,15 @@ TTS 의 echo 가 RTP queue 에 쌓여 STT 가 비음성 인식으로 헷갈림.
 
 ---
 
-### 4. TTS playback 후 첫 chunk 의 echo
+### 4. TTS playback 후 첫 chunk 의 echo — 해결됨
 
-**현황**: 일부 turn 에서 STT 가 봇 reply 의 끝부분 echo 를 짧게 인식 (예:
-"가요") → no-input 카운터 증가. RMS-based VAD 가 echo 와 user speech 구분 못
-함.
+**조치** (2026-05-11): `TTSPipeline.last_chunk_played_at` 기록 + `CallAudioSource`
+가 `tts_last_play_at` callable 받아 `last_play + _ECHO_MASK_SEC (200ms)` 이내
+inbound RTP 를 silence 로 치환.
 
-**아이디어**:
-- TTS playback 끝나는 시각을 audio_source 에 알려줘 그 시각 + 200ms 까지의
-  RTP 청크를 silence 로 마스킹.
-- `CALLBOT_TTS_DISABLED=1` 환경에서는 영향 없으니 회귀 검증 가능.
+**효과** (e2e 5턴): 각 turn `echo_masked=107~138 chunks` (≈2-3s 봇 응답 echo
+차단). audio_buf 크기가 이전 17-24s → 5-8s 로 감소 (sync API 부담 ↓). 매 turn
+첫 STT 의 false-EOS non_voice 회귀 해결 — pre-roll TTS 활성화 가능.
 
 ---
 

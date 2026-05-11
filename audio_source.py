@@ -26,6 +26,7 @@ import os
 import time
 import threading
 import wave
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -43,6 +44,11 @@ _LOG_EVERY_N_READS = 50
 # DEBUG_DUMP_RTP=1일 때 WAV가 저장될 디렉터리
 _DUMP_DIR = "wav/_dump"
 
+# Echo masking 윈도우 (s) — TTS 마지막 writeAudio() 시각 + 이 만큼의 시간 동안
+# inbound RTP 청크를 silence 로 치환. 봇 TTS / pre-roll 재생 중/직후의 잔여
+# RTP echo 가 다음 turn 의 STT 를 false-EOS 시키는 회귀를 차단.
+_ECHO_MASK_SEC = 0.20
+
 
 class CallAudioSource:
     """
@@ -55,19 +61,26 @@ class CallAudioSource:
         audio_src.stop()  # 외부에서 강제 종료 시
     """
 
-    def __init__(self, call, timeout_sec: int = 15, sample_rate: int = 16000):
+    def __init__(self, call, timeout_sec: int = 15, sample_rate: int = 16000,
+                 tts_last_play_at: Optional[Callable[[], float]] = None):
         """
         Args:
             call: pyVoIP VoIPCall 인스턴스
             timeout_sec: 최대 청취 시간 (초). 초과 시 generator 종료.
             sample_rate: STT 가 받을 sample rate. 8000 (telephony native) 또는 16000 (chirp_3).
                          8000 이면 upsample 단계 skip — 모델 훈련 분포와 일치.
+            tts_last_play_at: 마지막 봇 TTS writeAudio() 시각을 반환하는 callable.
+                              현재 시각이 이 값 + _ECHO_MASK_SEC 이내면 RTP chunk
+                              를 silence 로 치환 (TTSPipeline.last_chunk_played_at
+                              참조 예정). None 이면 마스킹 비활성.
         """
         self._call        = call
         self._timeout_sec = timeout_sec
         self._sample_rate = sample_rate
         self._stop_event  = threading.Event()
         self._buffer      = b""
+        self._tts_last_play_at = tts_last_play_at
+        self._echo_mask_count  = 0  # 마스킹된 청크 수 (진단 로그용)
 
         # 진단용 WAV 덤프 (DEBUG_DUMP_RTP=1)
         # _dump_8k: 네트워크 RTP 그대로 (항상 8kHz). _dump_out: STT 가 본 데이터 (sample_rate 따라).
@@ -121,6 +134,18 @@ class CallAudioSource:
                 break
 
             total_reads += 1
+
+            # Echo masking — TTS 재생 중/직후 잔여 RTP echo 차단.
+            # pre-roll 또는 봇 응답 끝부분의 echo 가 다음 turn 의 STT 를
+            # false-EOS 시키지 않도록, last writeAudio() + _ECHO_MASK_SEC 안의
+            # inbound chunk 는 silence 로 치환. user TTS 가 마스킹 윈도우 밖에
+            # 도착하면 정상 인식 (마스킹은 짧게 200ms).
+            if self._tts_last_play_at is not None:
+                last_play = self._tts_last_play_at()
+                if last_play > 0 and (time.time() - last_play) < _ECHO_MASK_SEC:
+                    raw = _SILENCE_160
+                    self._echo_mask_count += 1
+
             is_silence = (raw == _SILENCE_160)
 
             if not is_silence:
@@ -173,7 +198,8 @@ class CallAudioSource:
             if is_silence:
                 time.sleep(0.01)
 
-        print(f"[AudioSource] Done: {non_empty_reads}/{total_reads} reads had audio (started={started})")
+        print(f"[AudioSource] Done: {non_empty_reads}/{total_reads} reads had audio "
+              f"(started={started}, echo_masked={self._echo_mask_count})")
 
         if self._dump_enabled:
             self._save_dump_wavs()

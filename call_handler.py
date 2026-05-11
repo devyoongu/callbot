@@ -89,6 +89,10 @@ class TTSPipeline:
         self._idle_event.set()
         self._inflight    = 0
         self._inflight_lock = threading.Lock()
+        # 마지막 writeAudio() 시각 — CallAudioSource 가 echo masking 윈도우 산정에
+        # 사용. 봇 TTS 재생 중/직후 (Asterisk relay 의 잔여 RTP echo) 의 inbound
+        # 청크를 silence 로 치환해 다음 turn 의 STT 가 false-EOS 되지 않게 함.
+        self.last_chunk_played_at: float = 0.0
         self.play_thread  = threading.Thread(
             target=self._play_loop,
             name=f"tts-play-{call_id[:8]}",
@@ -260,6 +264,7 @@ class TTSPipeline:
                         break
                     try:
                         self.call.writeAudio(chunk)
+                        self.last_chunk_played_at = time.time()
                         sent += 1
                     except Exception as e:
                         logger.warning(f"[TTS] writeAudio error ({text[:30]!r}): {e}")
@@ -283,6 +288,7 @@ class TTSPipeline:
                         break
                     try:
                         self.call.writeAudio(c)
+                        self.last_chunk_played_at = time.time()
                         sent += 1
                     except Exception as e:
                         logger.warning(f"[TTS] writeAudio error ({text[:30]!r}): {e}")
@@ -385,7 +391,12 @@ def handle_call(call):
 
             # 3a. STT 스트리밍 청취 — STT 먼저 만들어 sample_rate 결정 후 audio_src 에 전달
             stt       = create_stt(cfg.CREDENTIALS_DIR)
-            audio_src = CallAudioSource(call, timeout_sec=cfg.LISTEN_TIMEOUT_SEC, sample_rate=stt.sample_rate)
+            audio_src = CallAudioSource(
+                call,
+                timeout_sec=cfg.LISTEN_TIMEOUT_SEC,
+                sample_rate=stt.sample_rate,
+                tts_last_play_at=lambda: pipeline.last_chunk_played_at,
+            )
 
             # EOS 시점 pre-roll 멘트 — sync API + Athena 첫 응답까지의 dead air
             # (~2.5-3s) 를 채우는 실험적 옵션. cfg.PREROLL_MESSAGE 가 비어 있으면

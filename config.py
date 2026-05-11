@@ -42,11 +42,10 @@ FALLBACK_GREETING  = os.getenv("FALLBACK_GREETING", "안녕하세요. 무엇을 
 FALLBACK_NO_INPUT  = os.getenv("FALLBACK_NO_INPUT", "잘 들리지 않습니다. 다시 말씀해 주세요.")
 FALLBACK_GOODBYE   = os.getenv("FALLBACK_GOODBYE", "감사합니다. 안녕히 계세요.")
 # EOS 직후 즉시 enqueue 되는 pre-roll 멘트 — sync recognize ~2s + Athena 첫
-# 응답까지의 dead air 를 채우는 실험. 비워두면 비활성 (default). 활성화 예:
-# PREROLL_MESSAGE="네, 잠시만요."
-# 초기 e2e 검증에서 직전 봇 응답의 echo 가 다음 turn 의 STT 를 false-EOS 시켜
-# 매 turn 추가 fallback 이 발생하는 회귀가 관측됨 — 디자인 보강 후 재시도.
-PREROLL_MESSAGE    = os.getenv("PREROLL_MESSAGE", "")
+# 응답까지의 dead air 를 채워 사용자 체감 응답성 개선. turn 0 (greeting 직후)
+# 은 자연스러움 위해 skip. 빈 문자열로 두면 비활성. echo 회귀는 audio_source
+# 의 echo masking (_ECHO_MASK_SEC) 이 차단.
+PREROLL_MESSAGE    = os.getenv("PREROLL_MESSAGE", "네, 잠시만요.")
 
 
 def athena_configured() -> bool:
