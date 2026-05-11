@@ -18,10 +18,14 @@
 
 **남은 아이디어**:
 - (a) **TTS pre-roll 병렬화** — silence detection 확정 시점에 봇의 안내멘트
-  ("잠시만 기다려 주세요", "확인하고 답변드리겠습니다") TTS 합성/재생을 미리
-  시작. user 가 들을 때는 latency 가 숨겨짐. Athena 호출 전에 재생되므로
-  `sync recognize 결과 → Athena 질의` 와 직렬 의존도 없음. 매 turn 반복 시
-  부자연스러움 검증 필요 (긴 query 한정 또는 randomized variation).
+  TTS 합성/재생을 미리 시작. 인프라 추가됨 (`call_handler._eos_preroll` +
+  `cfg.PREROLL_MESSAGE`, default 비활성). 활성화 (`PREROLL_MESSAGE="네, 잠시만요."`)
+  e2e 검증 시 **직전 봇 응답의 RTP echo 가 다음 turn 의 STT 를 false-EOS 시켜
+  매 turn 추가 fallback** 회귀 관측. 디자인 보강 필요:
+    - echo 마스킹 (TTS playback 시각 + 200ms 까지 RTP 청크 silence 처리, P1 #4)
+    - 또는 pre-roll 을 STT Listening 시작 *후* 봇 응답 echo 가 잦아든 뒤 enqueue
+    - 또는 짧은 단발 ack 가 아닌 단/장 가변 pre-roll (이상적 길이 ≥ sync API
+      잔여시간)
 - (b) **chirp_3 의 `streaming` 회귀 시도** (Google 측 개선 후) — 이번 fix
   문서 (stt-trailing-cutoff-fix-2026-05-11.md) 의 단위 테스트로 동일 wav 회귀
   가능.

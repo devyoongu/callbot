@@ -16,7 +16,7 @@ import time
 import uuid
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import config as cfg
 from audio_source import CallAudioSource
@@ -387,13 +387,23 @@ def handle_call(call):
             stt       = create_stt(cfg.CREDENTIALS_DIR)
             audio_src = CallAudioSource(call, timeout_sec=cfg.LISTEN_TIMEOUT_SEC, sample_rate=stt.sample_rate)
 
+            # EOS 시점 pre-roll 멘트 — sync API + Athena 첫 응답까지의 dead air
+            # (~2.5-3s) 를 채우는 실험적 옵션. cfg.PREROLL_MESSAGE 가 비어 있으면
+            # 비활성 (default). turn 0 은 greeting 직후라 자연스러움 위해 skip.
+            preroll_msg = cfg.PREROLL_MESSAGE if dialog_count > 0 else ""
+
+            def _eos_preroll():
+                if preroll_msg:
+                    pipeline.enqueue(preroll_msg, kind="preroll")
+
             try:
                 stt.initialize()
                 stt.start_streaming(audio_src)
                 # 블로킹 wait_for_result() 대신 능동 폴링 루프 사용
                 # (robi-t-callbot ai_handler.detect_voice() 폴링 패턴 적용)
                 success, transcript = _poll_stt_result(
-                    stt, audio_src, call, call_id, dialog_count
+                    stt, audio_src, call, call_id, dialog_count,
+                    on_eos=_eos_preroll,
                 )
             except Exception as e:
                 logger.error(f"[{call_id[:8]}] STT error: {e}")
@@ -571,6 +581,7 @@ def _poll_stt_result(
     call,
     call_id: str,
     dialog_count: int,
+    on_eos: Optional[Callable[[], None]] = None,
 ) -> Tuple[bool, str]:
     """
     robi-t-callbot ai_handler.detect_voice() 의 폴링 루프 패턴을 callbot에 적용.
@@ -629,6 +640,13 @@ def _poll_stt_result(
                 + (f" at {eos_t:.3f}" if eos_t else "")
                 + ", audio stopped"
             )
+            # Pre-roll TTS: sync API (~2s) + Athena 첫 응답 대기 동안의 dead air
+            # 를 채우기 위해 EOS 시점에 짧은 ack 를 즉시 enqueue. 비차단.
+            if on_eos is not None:
+                try:
+                    on_eos()
+                except Exception as e:
+                    logger.warning(f"[{call_id[:8]}] on_eos callback failed: {e}")
 
         # ③ final transcript 폴링
         transcript = stt.get_final_transcript()
