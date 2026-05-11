@@ -17,13 +17,15 @@
 **잔여**: 약 2.0s — 주된 floor 는 sync API call (us 리전, 2.0–2.7s).
 
 **남은 아이디어**:
-- (a) **TTS pre-roll 병렬화 — 적용됨** (2026-05-11). `cfg.PREROLL_MESSAGE`
-  기본값 `"네, 잠시만요."` + audio_source 의 echo masking 결합. e2e 5턴 검증
-  회귀 없음. 잔여 개선: 매 turn 동일 멘트 반복 자연스러움 검증 (긴 turn 한정
-  또는 randomized variation) — 사용자 청취 후 결정.
-- (b) **chirp_3 의 `streaming` 회귀 시도** (Google 측 개선 후) — 이번 fix
-  문서 (stt-trailing-cutoff-fix-2026-05-11.md) 의 단위 테스트로 동일 wav 회귀
-  가능.
+- (a) **TTS pre-roll 으로 체감 dead air 가리기 — 적용됨** (2026-05-11).
+  `cfg.PREROLL_MESSAGE="네, 잠시만요."` + audio_source echo masking. e2e 5턴
+  회귀 없음. **실제 latency 는 변동 없음 — 사용자가 EOS 후 ~500ms 에 ack 를
+  듣기 시작해 dead air 가 짧게 느껴지는 효과만**. 본질적 latency 단축은 아님.
+- (b) **chirp_3 의 `streaming` 회귀 시도** (Google 측 개선 후) — sync 의 +1.85s
+  latency 를 줄이려면 streaming 모드 회귀가 본질적 해결. 이번 fix 문서
+  (stt-trailing-cutoff-fix-2026-05-11.md) 의 단위 테스트로 회귀 가능.
+- (c) **asia 리전 recognizer** (Google 이 chirp_3 를 asia 출시 시) — sync API
+  의 us 왕복 latency (~300-500ms) 단축 가능.
 
 **측정 방법**: `test_stt_dump.py` 의 `avg elapsed` 비교 + 메트릭 패널의 `STT
 평균 latency`.
