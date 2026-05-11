@@ -475,14 +475,25 @@ class GoogleSTTV2:
     def _buffer_audio_with_vad(self, audio_buf: bytearray):
         """
         audio_source 에서 청크를 받아 audio_buf 에 누적. client VAD 로 발화 감지
-        및 silence (625ms) 시 EOS 커밋. EOS 후 추가로 EOS_TRAIL_CHUNKS 만큼 더
+        및 silence (500ms) 시 EOS 커밋. EOS 후 추가로 EOS_TRAIL_CHUNKS 만큼 더
         버퍼해 발화 끝부분 silence 도 sync recognize 에 포함 (chirp_3 가 자연
         종료 audio 를 받으면 인식 정확도 향상).
+
+        speech_started 전의 chunk 는 audio_buf 에 누적하지 않음 — leading silence
+        나 봇 응답 echo 잔재가 sync API 의 인식 컨텍스트를 흐리는 회귀 차단.
+        speech_started 직전 PRE_SPEECH_RING_CHUNKS 만큼은 ring buffer 로 보존 후
+        speech 시작 시 audio_buf 앞에 prepend (onset 음절 손실 방지).
+
+        loop 종료 시 EOS 가 트리거 안 됐으면 audio_buf 끝에 trailing silence 를
+        명시적으로 padding — audio_source 의 deadline 으로 강제 종료된 경우에도
+        sync API 가 자연 종료된 utterance 로 인식하게 함 (Turn 0 잘림 fix).
         """
         EXPECTED_CHUNK_BYTES = int(self.sample_rate * 0.125 * 2)  # 125ms — 2000@8k / 4000@16k
         RMS_THRESHOLD        = 200
         SILENCE_THRESHOLD    = 4     # 4 × 125ms = 500ms
         EOS_TRAIL_CHUNKS     = 2     # 250ms — EOS 후 trailing audio 추가 버퍼
+        PRE_SPEECH_RING_CHUNKS = 3   # 375ms — speech 시작 직전 보존 (onset 보호)
+        TRAIL_PADDING_CHUNKS = 4     # 500ms — EOS-less 종료 시 명시적 silence padding
 
         # webrtcvad 의 setuptools 82+ 호환 이슈 (pkg_resources 제거) 로 의존
         # 제거. RMS-only 판정. callbot 환경 (TTS-as-mic + telephony codec) 에서
@@ -493,21 +504,28 @@ class GoogleSTTV2:
         high_energy_count = 0
         eos_buffered      = 0
         eos_committed     = False
+        pre_speech_ring: "list[bytes]" = []  # speech 시작 전 마지막 N chunks
 
         for chunk in self._audio_source:
             if self._stop:
                 break
             if not chunk:
                 continue
-            audio_buf.extend(chunk)
             self._yielded_chunk_count += 1
 
             # EOS 후 trailing audio 모음
             if eos_committed:
+                audio_buf.extend(chunk)
                 eos_buffered += 1
                 if eos_buffered >= EOS_TRAIL_CHUNKS:
                     break
                 continue
+
+            # speech 시작 전: ring buffer 에만 보관 (audio_buf 에 누적 안 함)
+            if not speech_detected:
+                pre_speech_ring.append(chunk)
+                if len(pre_speech_ring) > PRE_SPEECH_RING_CHUNKS:
+                    pre_speech_ring.pop(0)
 
             if len(chunk) == EXPECTED_CHUNK_BYTES:
                 samples = np.frombuffer(chunk, dtype=np.int16)
@@ -519,6 +537,10 @@ class GoogleSTTV2:
                     if high_energy_count >= 2 and not speech_detected:
                         speech_detected = True
                         silence_frames  = 0
+                        # ring buffer 의 직전 chunks 를 audio_buf 앞에 prepend
+                        for c in pre_speech_ring:
+                            audio_buf.extend(c)
+                        pre_speech_ring.clear()
                         if not self.speech_started:
                             self.speech_started      = True
                             self.speech_started_time = time.time()
@@ -539,6 +561,26 @@ class GoogleSTTV2:
                             eos_committed = True
                             self.eos_done = True
                             self.eos_time = time.time()
+
+            # speech_detected 후의 chunk 는 audio_buf 에 누적 (EOS 트리거 후엔 위
+            # if eos_committed 분기에서 처리됨)
+            if speech_detected and not eos_committed:
+                audio_buf.extend(chunk)
+
+        # audio_source 가 EOS 트리거 없이 종료된 경우 (deadline / stop) — 발화는
+        # 됐는데 trailing silence 가 부족하면 sync API 가 발화 후반부를 미완성
+        # utterance 로 보고 잘라낼 수 있음. 명시적 silence padding 추가.
+        if speech_detected and not eos_committed:
+            silence_chunk = b"\x00" * EXPECTED_CHUNK_BYTES
+            for _ in range(TRAIL_PADDING_CHUNKS):
+                audio_buf.extend(silence_chunk)
+            self.eos_done = True
+            self.eos_time = time.time()
+            audio_ms = (len(audio_buf) // 2) / self.sample_rate * 1000
+            print(
+                f"[STT] EOS missed — trail-padded {TRAIL_PADDING_CHUNKS}×125ms "
+                f"silence (audio={audio_ms:.0f}ms) for sync recognize"
+            )
 
     def _handle_vad_event_unused(self, event_type):
         """Server VAD 이벤트 핸들러 — 기존 streaming 모드 잔재 (sync 전환 후 dead).
