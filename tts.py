@@ -240,15 +240,33 @@ _tts_instance: Optional[GoogleTTS] = None
 _CACHE_DIR = Path("wav/_cache")
 
 
-def _get_tts() -> GoogleTTS:
-    """프로세스 내 TTS 싱글톤 (통화 내 재사용)"""
+def _get_tts():
+    """프로세스 내 TTS 싱글톤. cfg.TTS_PROVIDER 에 따라 백엔드 선택.
+
+    - "google"    → GoogleTTS (GCP)
+    - "qwen3-tts" → Qwen3TTS  (사설 vLLM-Omni HTTP /v1/audio/speech)
+
+    두 백엔드 모두 `voice_name`, `synthesize(text)`, `synthesize_streaming(text)`
+    를 동일 시그니처로 노출하므로 호출자는 분기 불필요.
+    """
     global _tts_instance
     if _tts_instance is None:
-        _tts_instance = GoogleTTS(
-            voice=cfg.GCP_TTS_VOICE,
-            language_code="ko-KR",
-            credentials_dir=cfg.CREDENTIALS_DIR,
-        )
+        provider = cfg.TTS_PROVIDER
+        if provider == "qwen3-tts":
+            from tts_qwen3 import Qwen3TTS
+            _tts_instance = Qwen3TTS(
+                url=cfg.QWEN_TTS_URL,
+                voice=cfg.QWEN_TTS_VOICE,
+                language=cfg.QWEN_TTS_LANGUAGE,
+            )
+        else:
+            if provider != "google":
+                print(f"[TTS] Unknown TTS_PROVIDER={provider!r}, falling back to google")
+            _tts_instance = GoogleTTS(
+                voice=cfg.GCP_TTS_VOICE,
+                language_code="ko-KR",
+                credentials_dir=cfg.CREDENTIALS_DIR,
+            )
     return _tts_instance
 
 

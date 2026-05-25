@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>IPCC 콜봇 — 기동 및 드라이버 설정 가이드</title>
+<style>
+  :root {
+    --fg:        #1f2328;
+    --muted:    #57606a;
+    --bg:        #ffffff;
+    --code-bg:   #f6f8fa;
+    --border:    #d0d7de;
+    --accent:    #0969da;
+    --warn-bg:   #fff8c5;
+    --warn-bd:   #d4a72c;
+    --ok:        #1a7f37;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans CJK KR",
+                 "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 32px 24px 64px;
+    line-height: 1.65;
+  }
+  h1 { font-size: 28px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+  h2 { font-size: 22px; margin-top: 40px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 17px; margin-top: 24px; }
+  p, li { color: var(--fg); }
+  code {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.88em;
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 16px;
+    overflow-x: auto;
+    line-height: 1.45;
+  }
+  pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: 0.86em;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 12px 0;
+    font-size: 0.94em;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: 8px 12px;
+    text-align: left;
+    vertical-align: top;
+  }
+  th {
+    background: var(--code-bg);
+    font-weight: 600;
+  }
+  .note {
+    background: var(--warn-bg);
+    border-left: 4px solid var(--warn-bd);
+    padding: 10px 14px;
+    margin: 14px 0;
+    border-radius: 4px;
+  }
+  .note strong { color: var(--fg); }
+  .muted { color: var(--muted); font-size: 0.92em; }
+  .toc {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 20px;
+  }
+  .toc ol { margin: 4px 0; padding-left: 20px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .ok { color: var(--ok); font-weight: 600; }
+  .kbd {
+    display: inline-block;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 1px 6px;
+    background: #fafbfc;
+    font-family: monospace;
+    font-size: 0.85em;
+  }
+</style>
+</head>
+<body>
+
+<h1>IPCC 콜봇 — 기동 및 드라이버 설정 가이드</h1>
+<p class="muted">callbot + web-rtc + tts-service 의 로컬 기동 절차와 STT/TTS 드라이버 전환 방법을 정리한 문서입니다. 모든 명령은 워크스페이스 루트 <code>/Users/gimhyeseon/python/ipcc/</code> 기준입니다.</p>
+
+<div class="toc">
+  <strong>목차</strong>
+  <ol>
+    <li><a href="#arch">시스템 구조 한눈에</a></li>
+    <li><a href="#prereq">사전 준비</a></li>
+    <li><a href="#start">4개 프로세스 기동 절차</a></li>
+    <li><a href="#stop">정지·재기동</a></li>
+    <li><a href="#stt">STT 드라이버 설정</a></li>
+    <li><a href="#tts">TTS 드라이버 설정</a></li>
+    <li><a href="#verify">동작 검증 체크리스트</a></li>
+    <li><a href="#trouble">자주 발생하는 문제</a></li>
+  </ol>
+</div>
+
+<h2 id="arch">1. 시스템 구조 한눈에</h2>
+
+<pre><code>Browser (http://localhost:3000)
+  ├── JsSIP UA (1003) ──WSS──▶ Asterisk 172.31.79.202:8088
+  │                              └─ ext 2001 ─▶ callbot (Mac 로컬)
+  │                                                 └─ STT → Athena LLM → TTS
+  └── 타이핑 텍스트  ──HTTP──▶ tts-service :8001  (마이크로 송출용 8kHz WAV)
+
+web-rtc/server.py :8000
+  └── /tmp/callbot.log tail ──SSE──▶ 브라우저</code></pre>
+
+<table>
+  <thead><tr><th>컴포넌트</th><th>포트</th><th>역할</th></tr></thead>
+  <tbody>
+    <tr><td><code>callbot</code></td><td>SIP 5080 / RTP 16000-16100</td><td>SIP 2001 으로 등록, 인커밍 콜 처리 (STT → LLM → TTS)</td></tr>
+    <tr><td><code>tts-service</code></td><td>8001</td><td>브라우저 타이핑 → 8kHz WAV (마이크 트랙으로 송출)</td></tr>
+    <tr><td><code>web-rtc/server.py</code></td><td>8000</td><td>callbot 로그 tail → SSE 로 브라우저 push</td></tr>
+    <tr><td><code>http.server</code></td><td>3000</td><td>web-rtc 정적 UI (HTML/JS/CSS) 서빙</td></tr>
+  </tbody>
+</table>
+
+<h2 id="prereq">2. 사전 준비</h2>
+
+<ul>
+  <li>Python 3.11 + 각 서브디렉터리에 <code>venv/</code> 가 만들어져 있어야 합니다.</li>
+  <li><code>callbot/.env</code> 가 준비돼 있어야 합니다 (<code>callbot/.env.example</code> 참조).</li>
+  <li><code>credentials/</code> (워크스페이스 루트) 에 GCP 서비스 계정 JSON 1개 이상.</li>
+  <li>사설망 <code>172.31.79.202</code> (Asterisk), <code>172.31.79.203</code> (Qwen3 GPU 서버) 도달 가능한 네트워크.</li>
+  <li>각 venv 에 의존성 설치:
+    <pre><code>cd callbot &amp;&amp; source venv/bin/activate &amp;&amp; pip install -r requirements.txt
+cd tts-service &amp;&amp; source venv/bin/activate &amp;&amp; pip install -r requirements.txt
+cd web-rtc &amp;&amp; source venv/bin/activate &amp;&amp; pip install -r requirements.txt</code></pre>
+  </li>
+</ul>
+
+<h2 id="start">3. 4개 프로세스 기동 절차</h2>
+
+<p>순서가 중요합니다 — callbot 이 Asterisk 에 REGISTER 된 뒤에 브라우저가 2001 로 다이얼해야 하고, tts-service 가 떠 있어야 브라우저 타이핑 입력이 동작합니다.</p>
+
+<h3>3.1 callbot (SIP 2001)</h3>
+<pre><code>cd callbot
+source venv/bin/activate
+python main.py &gt; /tmp/callbot.log 2&gt;&amp;1 &amp;</code></pre>
+<p>기동 직후 <code>/tmp/callbot.log</code> 첫 10여 줄에 다음과 비슷한 배너가 보여야 합니다:</p>
+<pre><code>AI Callbot Starting
+  SIP Server : 172.31.79.202:5060
+  Extension  : 2001
+  STT        : qwen3-asr (ws://172.31.79.202:30000/api/ws, lang=Korean)
+  TTS        : qwen3-tts (http://172.31.79.203:30000, voice=femail_achernar)
+  Athena     : configured
+Registered as 2001@172.31.79.202. Waiting for calls...</code></pre>
+
+<h3>3.2 tts-service (브라우저 타이핑 → 마이크)</h3>
+<pre><code>cd tts-service
+source venv/bin/activate
+uvicorn server:app --host 127.0.0.1 --port 8001 &amp;</code></pre>
+<p>헬스체크:</p>
+<pre><code>curl http://127.0.0.1:8001/health
+# {"status":"ok","voice":"chirp3-hd-achernar","language":"ko-KR"}</code></pre>
+
+<h3>3.3 web-rtc 이벤트 브리지 (SSE 로 봇 로그 push)</h3>
+<pre><code>cd web-rtc
+source venv/bin/activate
+uvicorn server:app --host 127.0.0.1 --port 8000 &amp;</code></pre>
+
+<h3>3.4 정적 파일 서버 (브라우저 UI)</h3>
+<pre><code>cd web-rtc
+python -m http.server 3000 &amp;</code></pre>
+
+<p>그리고 브라우저에서 <a href="http://localhost:3000">http://localhost:3000</a> 열고 <strong>Call 2001</strong> 버튼을 누르면 인사말이 들립니다.</p>
+
+<h2 id="stop">4. 정지·재기동</h2>
+
+<pre><code># 전체 정지
+pkill -f "python main.py"                          # callbot
+pkill -f "uvicorn server:app .* 8001"              # tts-service
+pkill -f "uvicorn server:app .* 8000"              # web-rtc 브리지
+pkill -f "http.server 3000"                        # 정적 서버
+
+# callbot 만 재기동 (드라이버 변경 후 가장 자주 쓰는 패턴)
+pkill -f "python main.py"
+cd callbot &amp;&amp; source venv/bin/activate &amp;&amp; python main.py &gt; /tmp/callbot.log 2&gt;&amp;1 &amp;</code></pre>
+
+<h2 id="stt">5. STT 드라이버 설정</h2>
+
+<p><code>callbot/.env</code> 의 <code>STT_PROVIDER</code> 값으로 전환합니다. <strong>변경 후 callbot 재기동 필요</strong>.</p>
+
+<table>
+  <thead><tr><th>값</th><th>설명</th><th>필요 환경변수</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>google</code></td>
+      <td>Google Cloud Speech-to-Text V2 (default). <code>chirp_3</code> 모델 권장</td>
+      <td><code>GCP_PROJECT_ID</code>, <code>GCP_STT_MODEL</code>, <code>GCP_STT_LANGUAGE</code>, <code>CREDENTIALS_DIR</code></td>
+    </tr>
+    <tr>
+      <td><code>qwen3-asr</code></td>
+      <td>원격 GPU 서버의 Qwen3-ASR WebSocket. clientEOS→Final ~150ms (Google sync 대비 ~20×)</td>
+      <td><code>QWEN_ASR_URL</code>, <code>QWEN_ASR_LANGUAGE</code>, <code>QWEN_ASR_CONTEXT</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>5.1 Google STT 설정 예</h3>
+<pre><code>STT_PROVIDER=google
+GCP_PROJECT_ID=gen-lang-client-0665942228
+GCP_STT_MODEL=chirp_3      # 또는 telephony
+GCP_STT_LANGUAGE=ko-KR
+CREDENTIALS_DIR=/Users/gimhyeseon/python/ipcc/credentials</code></pre>
+
+<h3>5.2 Qwen3-ASR 설정 예</h3>
+<pre><code>STT_PROVIDER=qwen3-asr
+QWEN_ASR_URL=ws://172.31.79.202:30000/api/ws
+QWEN_ASR_LANGUAGE=Korean   # 풀네임 (가이드 §7)
+QWEN_ASR_CONTEXT=          # 도메인 컨텍스트 (옵션)</code></pre>
+
+<div class="note">
+  <strong>드라이버 식별:</strong> callbot 기동 배너에 <code>STT : qwen3-asr (...)</code> 또는 <code>STT : google (chirp_3)</code> 가 출력됩니다. 통화 중에는 <code>/tmp/callbot.log</code> 의 <code>[STT] Final (qwen3): ...</code> 또는 <code>STT result: ...</code> 라인으로 확인.
+</div>
+
+<h2 id="tts">6. TTS 드라이버 설정</h2>
+
+<p><code>callbot/.env</code> 의 <code>TTS_PROVIDER</code> 값으로 전환합니다. <strong>변경 후 callbot 재기동 필요</strong>.</p>
+
+<table>
+  <thead><tr><th>값</th><th>설명</th><th>필요 환경변수</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>google</code></td>
+      <td>Google Cloud Text-to-Speech (default). <code>chirp3-hd-achernar</code> 한국어 여성 음성</td>
+      <td><code>GCP_TTS_VOICE</code>, <code>CREDENTIALS_DIR</code></td>
+    </tr>
+    <tr>
+      <td><code>qwen3-tts</code></td>
+      <td>원격 GPU 서버의 Qwen3-TTS HTTP (OpenAI 호환). TTFA 200~350ms</td>
+      <td><code>QWEN_TTS_URL</code>, <code>QWEN_TTS_VOICE</code>, <code>QWEN_TTS_LANGUAGE</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>6.1 Google TTS 설정 예</h3>
+<pre><code>TTS_PROVIDER=google
+GCP_TTS_VOICE=chirp3-hd-achernar    # 또는 chirp3-hd-achird (남성)
+CREDENTIALS_DIR=/Users/gimhyeseon/python/ipcc/credentials</code></pre>
+
+<h3>6.2 Qwen3-TTS 설정 예</h3>
+<pre><code>TTS_PROVIDER=qwen3-tts
+QWEN_TTS_URL=http://172.31.79.203:30000
+QWEN_TTS_VOICE=femail_achernar      # 또는 mail_achird (남성)
+QWEN_TTS_LANGUAGE=Auto</code></pre>
+
+<div class="note">
+  <strong>캐시 분리:</strong> 캐시 키가 <code>sha256(text + voice_name)</code> 이라 Google ↔ Qwen3 전환 시 두 캐시가 자동으로 분리됩니다. 충돌하지 않으므로 같은 문장이 다른 음성으로 재생될 우려는 없습니다.
+</div>
+
+<h3>6.3 드라이버 단독 검증</h3>
+<pre><code># 서버 헬스
+curl http://172.31.79.203:30000/health
+
+# 24kHz PCM 스트리밍 재생 (ffplay 필요)
+curl -sN -X POST http://172.31.79.203:30000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"voice":"femail_achernar","input":"안녕하세요 테스트입니다","response_format":"pcm","stream":true}' \
+  | ffplay -f s16le -ar 24000 -ac 1 -nodisp -autoexit -
+
+# callbot 코드 통해 한 줄 합성
+cd callbot &amp;&amp; source venv/bin/activate
+python -c "from tts_qwen3 import Qwen3TTS; \
+           pcm = Qwen3TTS(url='http://172.31.79.203:30000').synthesize('안녕하세요'); \
+           print(len(pcm), 'bytes')"</code></pre>
+
+<h2 id="verify">7. 동작 검증 체크리스트</h2>
+
+<ol>
+  <li>4개 프로세스 모두 떴는지: <code>ps aux | grep -E "main.py|uvicorn|http.server" | grep -v grep</code></li>
+  <li>callbot 배너의 STT/TTS 드라이버 값이 의도와 일치</li>
+  <li>브라우저 <a href="http://localhost:3000">http://localhost:3000</a> 에서 SIP 상태가 <code>Registered</code> → <code>In Call</code> 순으로 전환</li>
+  <li>인사말이 들리고 (TTS), 마이크 또는 타이핑 입력에 대한 응답이 합성·재생</li>
+  <li><code>/tmp/callbot.log</code> 에 <code>TTS TTFA: ... (ttfa=NNms)</code>, <code>STT result: ...</code> 라인이 흐름</li>
+  <li>5턴 자동 검증: 워크스페이스 루트에서
+    <pre><code>source web-rtc/venv/bin/activate
+HEADLESS=1 python playwright_call.py</code></pre>
+  </li>
+</ol>
+
+<h2 id="trouble">8. 자주 발생하는 문제</h2>
+
+<table>
+  <thead><tr><th>증상</th><th>원인 / 조치</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>브라우저에서 <code>Call 2001</code> 눌렀는데 통화 안 됨</td>
+      <td>callbot 이 REGISTER 되지 않은 상태. <code>/tmp/callbot.log</code> 의 <code>Registered as 2001@...</code> 라인 확인. 없으면 Asterisk 도달 가능한 네트워크/방화벽인지, <code>SIP_PASSWORD</code> 일치 확인.</td>
+    </tr>
+    <tr>
+      <td>인사말은 들리는데 응답 음성이 안 나옴</td>
+      <td>TTS 드라이버 측 에러 가능성. <code>grep "TTS synth failed" /tmp/callbot.log</code>. Qwen3-TTS 면 <code>172.31.79.203:30000</code> 도달성 (<code>curl /health</code>) 확인. Google 이면 GCP credential / quota 확인.</td>
+    </tr>
+    <tr>
+      <td>마이크/타이핑 입력이 봇에 전달되지 않음</td>
+      <td>tts-service (:8001) 가 떠 있는지 확인. 브라우저 DevTools Network 탭에서 <code>POST /tts</code> 요청이 200 으로 떨어지는지 확인. CORS 에러면 <code>tts-service/server.py</code> 의 <code>allow_origins</code> 점검.</td>
+    </tr>
+    <tr>
+      <td>STT 결과가 자꾸 잘리거나 못 알아들음</td>
+      <td>Qwen3-ASR: TTS-as-mic 환경에서 일부 발화가 인식 안 될 수 있음. <code>QWEN_ASR_CONTEXT</code> 에 도메인 키워드 넣어보거나 <code>STT_PROVIDER=google</code> + <code>GCP_STT_MODEL=chirp_3</code> 로 전환. Google: 동일 음원에 <code>chirp_3</code> 모델 + adaptation phrase 가 일반적으로 안정.</td>
+    </tr>
+    <tr>
+      <td>callbot 종료 안 됨</td>
+      <td><code>pkill -f "python main.py"</code>. PID 직접 kill 보다 <code>-f &lt;pattern&gt;</code> 방식 권장 (Python 인터프리터 절대경로가 길어서 PID 추적이 번거로움).</td>
+    </tr>
+  </tbody>
+</table>
+
+<p class="muted">참고: 워크스페이스 루트 <code>CLAUDE.md</code>, 컴포넌트별 <code>callbot/CLAUDE.md</code>, <code>web-rtc/README.md</code>, <code>tts-service/README.md</code> 에 더 자세한 구조 설명이 있습니다.</p>
+
+</body>
+</html>

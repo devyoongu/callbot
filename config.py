@@ -27,6 +27,14 @@ QWEN_ASR_URL = os.getenv("QWEN_ASR_URL", "ws://172.31.79.202:30000/api/ws")
 QWEN_ASR_LANGUAGE = os.getenv("QWEN_ASR_LANGUAGE", "Korean")  # 풀네임 필수 (가이드 §7)
 QWEN_ASR_CONTEXT  = os.getenv("QWEN_ASR_CONTEXT", "")          # 도메인 컨텍스트 (옵션)
 
+# ── TTS 드라이버 선택 ─────────────────────────────────────────────────
+# "google"     — GoogleTTS (default; GCP_TTS_VOICE 사용)
+# "qwen3-tts"  — 원격 Qwen3-TTS HTTP (vLLM-Omni, OpenAI 호환)
+TTS_PROVIDER       = os.getenv("TTS_PROVIDER", "google").lower()
+QWEN_TTS_URL       = os.getenv("QWEN_TTS_URL",      "http://172.31.79.203:30000")
+QWEN_TTS_VOICE     = os.getenv("QWEN_TTS_VOICE",    "femail_achernar")
+QWEN_TTS_LANGUAGE  = os.getenv("QWEN_TTS_LANGUAGE", "Auto")
+
 # ── Google Cloud ───────────────────────────────────────────────────────
 GCP_PROJECT_ID   = os.getenv("GCP_PROJECT_ID", "gen-lang-client-0665942228")
 GCP_STT_MODEL    = os.getenv("GCP_STT_MODEL", "chirp_3")

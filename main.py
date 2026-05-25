@@ -110,7 +110,10 @@ def main():
         logger.info(f"  STT        : qwen3-asr ({cfg.QWEN_ASR_URL}, lang={cfg.QWEN_ASR_LANGUAGE})")
     else:
         logger.info(f"  STT        : google ({cfg.GCP_STT_MODEL})")
-    logger.info(f"  TTS Voice  : {cfg.GCP_TTS_VOICE}")
+    if cfg.TTS_PROVIDER == "qwen3-tts":
+        logger.info(f"  TTS        : qwen3-tts ({cfg.QWEN_TTS_URL}, voice={cfg.QWEN_TTS_VOICE})")
+    else:
+        logger.info(f"  TTS Voice  : {cfg.GCP_TTS_VOICE}")
     logger.info(f"  Athena     : {'configured' if cfg.athena_configured() else 'NOT configured (fallback mode)'}")
     logger.info("=" * 60)
 
