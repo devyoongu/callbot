@@ -622,8 +622,23 @@ class GoogleSTTV2:
                 self.speech_started_time = None
 
 
-def create_stt(credentials_dir: str = None) -> GoogleSTTV2:
-    """매 대화 턴마다 새 GoogleSTTV2 인스턴스 생성"""
+def create_stt(credentials_dir: str = None):
+    """매 대화 턴마다 새 STT 인스턴스 생성.
+
+    cfg.STT_PROVIDER 에 따라 드라이버 분기:
+      - "google"     → GoogleSTTV2 (GCP, default)
+      - "qwen3-asr"  → Qwen3WebSocketSTT (사설 WS, 16kHz float32)
+    """
+    provider = cfg.STT_PROVIDER
+    if provider == "qwen3-asr":
+        from stt_qwen3 import Qwen3WebSocketSTT
+        return Qwen3WebSocketSTT(
+            url=cfg.QWEN_ASR_URL,
+            language=cfg.QWEN_ASR_LANGUAGE,
+            context=cfg.QWEN_ASR_CONTEXT,
+        )
+    if provider != "google":
+        print(f"[STT] Unknown STT_PROVIDER={provider!r}, falling back to google")
     return GoogleSTTV2(
         project_id=cfg.GCP_PROJECT_ID,
         model=cfg.GCP_STT_MODEL,

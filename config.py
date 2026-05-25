@@ -19,6 +19,14 @@ SIP_USERNAME    = os.getenv("SIP_USERNAME", "2001")
 SIP_PASSWORD    = os.getenv("SIP_PASSWORD", "secret2001")
 _LOCAL_IP       = os.getenv("LOCAL_IP", "")
 
+# ── STT 드라이버 선택 ─────────────────────────────────────────────────
+# "google"   — GoogleSTTV2 (default; GCP_STT_MODEL 로 chirp_3/telephony 등 선택)
+# "qwen3-asr" — 원격 Qwen3-ASR WebSocket (QWEN_ASR_URL 로 endpoint 지정)
+STT_PROVIDER = os.getenv("STT_PROVIDER", "google").lower()
+QWEN_ASR_URL = os.getenv("QWEN_ASR_URL", "ws://172.31.79.202:30000/api/ws")
+QWEN_ASR_LANGUAGE = os.getenv("QWEN_ASR_LANGUAGE", "Korean")  # 풀네임 필수 (가이드 §7)
+QWEN_ASR_CONTEXT  = os.getenv("QWEN_ASR_CONTEXT", "")          # 도메인 컨텍스트 (옵션)
+
 # ── Google Cloud ───────────────────────────────────────────────────────
 GCP_PROJECT_ID   = os.getenv("GCP_PROJECT_ID", "gen-lang-client-0665942228")
 GCP_STT_MODEL    = os.getenv("GCP_STT_MODEL", "chirp_3")

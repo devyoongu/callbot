@@ -7,3 +7,4 @@ wav/_dump/
 wav/_cache/
 *.wav
 __pycache__/
+venv/

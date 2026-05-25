@@ -106,7 +106,10 @@ def main():
     logger.info(f"  Local Port : {cfg.SIP_LOCAL_PORT}")
     logger.info(f"  Extension  : {cfg.SIP_USERNAME}")
     logger.info(f"  Local IP   : {local_ip}")
-    logger.info(f"  STT Model  : {cfg.GCP_STT_MODEL}")
+    if cfg.STT_PROVIDER == "qwen3-asr":
+        logger.info(f"  STT        : qwen3-asr ({cfg.QWEN_ASR_URL}, lang={cfg.QWEN_ASR_LANGUAGE})")
+    else:
+        logger.info(f"  STT        : google ({cfg.GCP_STT_MODEL})")
     logger.info(f"  TTS Voice  : {cfg.GCP_TTS_VOICE}")
     logger.info(f"  Athena     : {'configured' if cfg.athena_configured() else 'NOT configured (fallback mode)'}")
     logger.info("=" * 60)
