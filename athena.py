@@ -1,7 +1,7 @@
 """
 callbot/athena.py — Athena LLM 클라이언트
 
-athena-llm-guide.md 의 AthenaClient 클래스 기반.
+260423_athena-llm-guide.md 의 AthenaClient 클래스 기반.
 query_sync(): async query()를 동기 컨텍스트(AGI/callbot 스레드)에서 사용하기 위한 래퍼.
 """
 import uuid

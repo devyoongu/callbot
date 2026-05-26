@@ -1,7 +1,7 @@
 """
 callbot/tts.py — Google Cloud Text-to-Speech 핸들러
 
-google-stt-tts-guide.md 의 GoogleTTS 클래스 기반.
+260423_google-stt-tts-guide.md 의 GoogleTTS 클래스 기반.
 synthesize_pcm_8k(): 텍스트 → 8kHz PCM (pyVoIP writeAudio 전달용)
 """
 import audioop

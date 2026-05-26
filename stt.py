@@ -1,7 +1,7 @@
 """
 callbot/stt.py — Google Cloud Speech-to-Text V2 스트리밍 인식기
 
-google-stt-tts-guide.md 의 GoogleSTTV2 클래스 기반.
+260423_google-stt-tts-guide.md 의 GoogleSTTV2 클래스 기반.
 telephony 모델: 전화 품질 오디오(8kHz) 최적화, 16kHz PCM 입력 지원.
 """
 import threading

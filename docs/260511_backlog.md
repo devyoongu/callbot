@@ -149,7 +149,7 @@ streaming 의 ~570ms 와 비교가 의미 없음.
 
 ### 11. Google STT 의 새로운 streaming 모드 출시 시 sync vs streaming 비교
 
-`stt-trailing-cutoff-fix-2026-05-11.md` 의 단위 테스트로 즉시 비교 가능.
+`260511_stt-trailing-cutoff-fix.md` 의 단위 테스트로 즉시 비교 가능.
 sync 의 +1.85s latency 를 줄일 수 있으면 streaming 회귀 검토.
 
 ---
@@ -175,4 +175,4 @@ sync 의 +1.85s latency 를 줄일 수 있으면 streaming 회귀 검토.
 - **단위 테스트**: `test_stt_dump.py` (REPEAT=N 으로 평균)
 - **e2e 회귀**: web-rtc 의 5턴 multi-query — 메트릭 패널로 실시간 측정
 - **로그 분석**: `[STT] Final`, `[STT] Turn summary`, `[STT] EOS triggered`
-  라인을 grep — `stt-trailing-cutoff-fix-2026-05-11.md` 의 진단 로그 그대로
+  라인을 grep — `260511_stt-trailing-cutoff-fix.md` 의 진단 로그 그대로
