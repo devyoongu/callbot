@@ -107,6 +107,7 @@
   <strong>목차</strong>
   <ol>
     <li><a href="#arch">시스템 구조 한눈에</a></li>
+    <li><a href="#protocol">브라우저 ↔ Asterisk 통신 (WebRTC)</a></li>
     <li><a href="#prereq">사전 준비</a></li>
     <li><a href="#start">4개 프로세스 기동 절차</a></li>
     <li><a href="#stop">정지·재기동</a></li>
@@ -138,7 +139,72 @@ web-rtc/server.py :8000
   </tbody>
 </table>
 
-<h2 id="prereq">2. 사전 준비</h2>
+<h2 id="protocol">2. 브라우저 ↔ Asterisk 통신 (WebRTC)</h2>
+
+<p>브라우저는 raw UDP/RTP 소켓을 못 열기 때문에 <strong>WebRTC 스택</strong>을 통해 Asterisk 와 두 갈래로 통신합니다. 시그널링과 미디어가 분리되며, 양쪽 다 표준 SIP/RTP 와는 다른 운반 방식을 씁니다.</p>
+
+<h3>2.1 시그널링 — SIP over WebSocket</h3>
+
+<p><code>asterisk/conf/pjsip.conf</code> 에 <code>[transport-ws]</code> 가 정의되어 있고 브라우저 엔드포인트 <code>1003</code> 은 이 transport 를 사용합니다.</p>
+
+<pre><code>[transport-ws]
+type=transport
+protocol=ws
+
+[1003]
+type=endpoint
+transport=transport-ws
+...</code></pre>
+
+<p>브라우저(JsSIP)는 <code>ws://172.31.79.202:8088/ws</code> 에 WebSocket 으로 붙어 REGISTER / INVITE / BYE 등 SIP 메시지를 평소의 UDP 대신 <strong>TCP/WS</strong> 위로 주고받습니다. Asterisk <code>http.conf</code> 의 :8088 이 이 종단점입니다 (<code>enabled=yes</code> 필수).</p>
+
+<h3>2.2 미디어 — G.711 µ-law in DTLS-SRTP</h3>
+
+<p>1003 엔드포인트의 핵심은 <code>webrtc=yes</code> + <code>allow=ulaw</code> 두 줄입니다.</p>
+
+<pre><code>[1003]
+webrtc=yes        ; ice_support + dtls_* + rtcp_mux + use_avpf 자동 ON
+disallow=all
+allow=ulaw</code></pre>
+
+<p>브라우저가 WebRTC 로 송출하는 미디어 파이프라인:</p>
+
+<ol>
+  <li><strong>코덱: G.711 µ-law</strong> (8kHz 8-bit 로그 PCM) — SDP 협상으로 강제</li>
+  <li><strong>RTP</strong> 패킷화</li>
+  <li><strong>SRTP</strong> 로 암호화 — 키는 <strong>DTLS</strong> handshake 로 교환</li>
+  <li><strong>ICE</strong> 후보쌍 위 UDP 송수신, <strong>RTCP-mux</strong> 로 RTP·RTCP 단일 포트</li>
+</ol>
+
+<p>"브라우저가 PCM 통신을 못 한다"는 명제는 <em>raw</em> PCM/UDP 송신을 못 한다는 의미일 뿐이고, <strong>G.711 µ-law 는 WebRTC 표준 코덱</strong> 이라 브라우저 내부 WebRTC 엔진이 인코딩·패킷화·암호화까지 모두 처리합니다.</p>
+
+<div class="note">
+  <strong>왜 ulaw 전용?</strong> Asterisk 에 <code>codec_opus.so</code> 가 없는데 opus 를 같이 허용하면 SDP 협상에서 opus 가 선택되고, 콜봇(2001, ulaw 만 지원)과 브리지 단계에서 <code>"No path to translate (opus) -&gt; (ulaw)"</code> 로 통화 직후 끊깁니다. 양쪽을 동일 코덱으로 통일해 트랜스코딩 자체를 회피합니다.
+</div>
+
+<h3>2.3 Asterisk → callbot 두 번째 다리</h3>
+
+<p>콜봇(2001) 은 평범한 SIP/UDP + 평문 RTP 입니다. <code>extensions.conf</code> 의 dialplan:</p>
+
+<pre><code>exten =&gt; 2001,1,Set(JITTERBUFFER(adaptive)=200)
+ same =&gt; n,Dial(PJSIP/2001,30)</code></pre>
+
+<p><code>JITTERBUFFER(adaptive)=200</code> 은 WebRTC 측 RTP 가 버스티해서 콜봇 STT 가 잘리던 문제 때문에 추가됐습니다. Asterisk 가 SRTP → 복호화 → 평문 RTP 로 변환하고, 양쪽 다 ulaw 라 트랜스코딩 없이 그대로 pyVoIP 로 넘깁니다.</p>
+
+<h3>2.4 End-to-end 프로토콜 스택</h3>
+
+<pre><code>브라우저                         Asterisk                          callbot (pyVoIP)
+─────────                       ────────                          ─────────────────
+SIP/WS → :8088 ─────────────▶  WebSocket transport
+SRTP/UDP (G.711 ulaw) ──────▶  DTLS 복호화 → 평문 RTP
+                                + JITTERBUFFER(adaptive=200)
+                                                      ─────────▶ SIP/UDP :5060
+                                                                 RTP/UDP (ulaw)
+                                                                 → audioop ulaw → 16-bit PCM 8kHz</code></pre>
+
+<p>요약: 브라우저 ↔ Asterisk = <strong>WebRTC (SIP-over-WS + DTLS-SRTP, ulaw)</strong>, Asterisk ↔ callbot = <strong>평문 SIP/RTP (ulaw)</strong>. Asterisk 가 암호화·시그널링 게이트웨이 역할을 합니다.</p>
+
+<h2 id="prereq">3. 사전 준비</h2>
 
 <ul>
   <li>Python 3.11 + 각 서브디렉터리에 <code>venv/</code> 가 만들어져 있어야 합니다.</li>
@@ -152,7 +218,7 @@ cd web-rtc &amp;&amp; source venv/bin/activate &amp;&amp; pip install -r require
   </li>
 </ul>
 
-<h2 id="start">3. 4개 프로세스 기동 절차</h2>
+<h2 id="start">4. 4개 프로세스 기동 절차</h2>
 
 <p>순서가 중요합니다 — callbot 이 Asterisk 에 REGISTER 된 뒤에 브라우저가 2001 로 다이얼해야 하고, tts-service 가 떠 있어야 브라우저 타이핑 입력이 동작합니다.</p>
 
@@ -188,7 +254,7 @@ python -m http.server 3000 &amp;</code></pre>
 
 <p>그리고 브라우저에서 <a href="http://localhost:3000">http://localhost:3000</a> 열고 <strong>Call 2001</strong> 버튼을 누르면 인사말이 들립니다.</p>
 
-<h2 id="stop">4. 정지·재기동</h2>
+<h2 id="stop">5. 정지·재기동</h2>
 
 <pre><code># 전체 정지
 pkill -f "python main.py"                          # callbot
@@ -200,7 +266,7 @@ pkill -f "http.server 3000"                        # 정적 서버
 pkill -f "python main.py"
 cd callbot &amp;&amp; source venv/bin/activate &amp;&amp; python main.py &gt; /tmp/callbot.log 2&gt;&amp;1 &amp;</code></pre>
 
-<h2 id="stt">5. STT 드라이버 설정</h2>
+<h2 id="stt">6. STT 드라이버 설정</h2>
 
 <p><code>callbot/.env</code> 의 <code>STT_PROVIDER</code> 값으로 전환합니다. <strong>변경 후 callbot 재기동 필요</strong>.</p>
 
@@ -237,7 +303,7 @@ QWEN_ASR_CONTEXT=          # 도메인 컨텍스트 (옵션)</code></pre>
   <strong>드라이버 식별:</strong> callbot 기동 배너에 <code>STT : qwen3-asr (...)</code> 또는 <code>STT : google (chirp_3)</code> 가 출력됩니다. 통화 중에는 <code>/tmp/callbot.log</code> 의 <code>[STT] Final (qwen3): ...</code> 또는 <code>STT result: ...</code> 라인으로 확인.
 </div>
 
-<h2 id="tts">6. TTS 드라이버 설정</h2>
+<h2 id="tts">7. TTS 드라이버 설정</h2>
 
 <p><code>callbot/.env</code> 의 <code>TTS_PROVIDER</code> 값으로 전환합니다. <strong>변경 후 callbot 재기동 필요</strong>.</p>
 
@@ -288,7 +354,7 @@ python -c "from tts_qwen3 import Qwen3TTS; \
            pcm = Qwen3TTS(url='http://172.31.79.203:30000').synthesize('안녕하세요'); \
            print(len(pcm), 'bytes')"</code></pre>
 
-<h2 id="verify">7. 동작 검증 체크리스트</h2>
+<h2 id="verify">8. 동작 검증 체크리스트</h2>
 
 <ol>
   <li>4개 프로세스 모두 떴는지: <code>ps aux | grep -E "main.py|uvicorn|http.server" | grep -v grep</code></li>
@@ -302,7 +368,7 @@ HEADLESS=1 python playwright_call.py</code></pre>
   </li>
 </ol>
 
-<h2 id="trouble">8. 자주 발생하는 문제</h2>
+<h2 id="trouble">9. 자주 발생하는 문제</h2>
 
 <table>
   <thead><tr><th>증상</th><th>원인 / 조치</th></tr></thead>
